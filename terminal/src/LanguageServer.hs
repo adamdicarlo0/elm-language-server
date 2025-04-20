@@ -6,10 +6,12 @@ module LanguageServer
   where
 
 import Control.Applicative ((<|>))
+import qualified Control.Concurrent.MVar
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 
+import Data.Foldable (foldrM)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.ByteString.Lazy.Char8 as BSLC
@@ -17,6 +19,8 @@ import qualified Data.Maybe as Maybe
 import qualified Data.List as List
 import Data.Name (Name)
 import qualified Data.Name as Name
+import qualified Data.Map.Utils as Map
+import qualified Data.Map.Strict as Map
 
 import qualified System.IO as IO
 import qualified System.Directory as Dir
@@ -44,13 +48,23 @@ import qualified Elm.Outline
 import qualified BackgroundWriter as BW
 
 import qualified AST.Source as Src
+import qualified Elm.ModuleName as ModuleName
+
+
+newtype State = State
+  { _changedFiles :: Control.Concurrent.MVar.MVar (Map.Map FilePath String)
+  }
+
 
 run :: IO ()
 run = do
-  loop ()
+  IO.hPutStr IO.stderr $ "creating state"
+  state <- State <$> Control.Concurrent.MVar.newMVar Map.empty
+  IO.hPutStr IO.stderr $ "state created"
+  loop state
 
   where
-    loop () =
+    loop state =
       do  contentLength <- readHeader
           body <- BSLC.hGet IO.stdin (contentLength + 2)
 
@@ -58,10 +72,10 @@ run = do
             Left err ->
               do  IO.hPutStr IO.stderr $ "Error decoding JSON: " ++ err
                   IO.hFlush IO.stderr
-                  loop ()
+                  loop state
 
             Right "initialized" ->
-              do  loop ()
+              do  loop state
 
             Right "initialize" ->
               do  let result =
@@ -77,7 +91,7 @@ run = do
                     Left err ->
                       do  IO.hPutStr IO.stderr $ "Error decoding JSON: " ++ err
                           IO.hFlush IO.stderr
-                          loop ()
+                          loop state
 
                     Right (id, rootPath) ->
                       do  let response =
@@ -85,10 +99,10 @@ run = do
                                   [ "capabilities" .= Aeson.object
                                     [ "definitionProvider" .= Aeson.object []
                                     -- , "documentSymbolProvider" .= True
-                                    -- , "textDocumentSync" .= Aeson.object
-                                    --     [ "save" .= True
-                                    --     , "openClose" .= True
-                                    --     ]
+                                    , "textDocumentSync" .= Aeson.object
+                                         [ "openClose" .= True
+                                         , "change" .= (2 :: Int)
+                                         ]
                                     -- , "referencesProvider" .= Aeson.object
                                     --   [ "workDoneProgress" .= True
                                     --   ]
@@ -108,7 +122,97 @@ run = do
                           sendProgressBegin "initialization-progress" "Discovering projects"
                           sendProgressEnd "initialization-progress"
 
-                          loop ()
+                          loop state
+
+            Right "textDocument/didOpen" ->
+              do  let result =
+                        Aeson.parseEither (\obj ->
+                          do  params <- obj .: "params"
+                              textDocument <- params .: "textDocument"
+                              version <- textDocument .: "version" :: Aeson.Parser Int
+
+                              uri <- textDocument .: "uri" :: Aeson.Parser String
+                              let filePath :: FilePath
+                                  filePath = drop 7 uri
+
+                              text <- textDocument .: "text" :: Aeson.Parser String
+
+                              return (version, filePath, text)
+                        ) =<< Aeson.eitherDecode body
+
+                  case result of
+                    Left err ->
+                      do  IO.hPutStr IO.stderr ("Error decoding JSON: " ++ err)
+                          loop state
+
+                    Right (version, filePath, text) ->
+                      do  let mVar = _changedFiles state
+
+                          IO.hPutStr IO.stderr $ "open: putting mvar"
+                          Control.Concurrent.MVar.modifyMVar_ mVar $ \a ->
+                            return $ Map.insert filePath text a
+                          IO.hPutStr IO.stderr $ "open: put mvar"
+
+                          loop state
+
+
+            Right "textDocument/didClose" ->
+              do  let result =
+                        Aeson.parseEither (\obj ->
+                          do  params <- obj .: "params"
+                              textDocument <- params .: "textDocument"
+
+                              uri <- textDocument .: "uri" :: Aeson.Parser String
+                              let filePath :: FilePath
+                                  filePath = drop 7 uri
+
+                              return filePath
+                        ) =<< Aeson.eitherDecode body
+
+                  case result of
+                    Left err ->
+                      do  IO.hPutStr IO.stderr ("Error decoding JSON: " ++ err)
+                          loop state
+
+                    Right filePath ->
+                      do  let mVar = _changedFiles state
+
+                          IO.hPutStr IO.stderr $ "open: putting mvar"
+                          Control.Concurrent.MVar.modifyMVar_ mVar $ \a ->
+                            return $ Map.delete filePath a
+                          IO.hPutStr IO.stderr $ "open: put mvar"
+
+                          loop state
+
+
+            Right "textDocument/didChange" ->
+              do  let result =
+                        Aeson.parseEither (\obj ->
+                          do  params <- obj .: "params"
+                              textDocument <- params .: "textDocument"
+                              version <- textDocument .: "version" :: Aeson.Parser Int
+                              uri <- textDocument .: "uri" :: Aeson.Parser String
+                              let filePath :: FilePath
+                                  filePath = drop 7 uri
+
+                              changes <- mapM parseTextDocumentContentChangeEvent =<< params .: "contentChanges" :: Aeson.Parser [((A.Position, A.Position), String)]
+
+                              return (version, filePath, changes)
+                        ) =<< Aeson.eitherDecode body
+
+                  case result of
+                    Left err ->
+                      do  IO.hPutStr IO.stderr ("Error decoding JSON: " ++ err)
+                          loop state
+
+                    Right (version, filePath, changes) ->
+                       do  let mVar = _changedFiles state
+                           files <- Control.Concurrent.MVar.takeMVar mVar
+                           let updatedFiles = Map.adjust (applyChanges changes) filePath files
+                           Control.Concurrent.MVar.putMVar mVar updatedFiles
+
+                           loop state
+
 
             Right "textDocument/definition" ->
               do  let result =
@@ -134,15 +238,15 @@ run = do
                   case result of
                     Left err ->
                       do  IO.hPutStr IO.stderr ("Error decoding JSON: " ++ err)
-                          loop ()
+                          loop state
 
                     Right (id, filePath, position) ->
-                      do  result <- Task.run $ findDefinition filePath position
+                      do  result <- Task.run $ findDefinition state filePath position
 
                           case result of
                             Right (definitionFilePath, region) ->
-                              do  respond id $ encodeRegion filePath region
-                                  loop ()
+                              do  respond id $ encodeRegion definitionFilePath region
+                                  loop state
 
                             Left err ->
                               do  showMessage MessageTypeError $
@@ -153,15 +257,60 @@ run = do
                                   Reporting.Exit.toStderr $ definitionExitToReport filePath err
                                   IO.hFlush IO.stderr
                                   IO.hSetBuffering IO.stderr (IO.BlockBuffering Nothing)
-                                  loop ()
+                                  loop state
 
             Right unknownMethod ->
               do  IO.hPutStr IO.stderr ("Unknown method: " ++ unknownMethod)
                   IO.hFlush IO.stderr
-                  loop ()
+                  loop state
 
 
+parsePosition :: Aeson.Value -> Aeson.Parser A.Position
+parsePosition =
+  Aeson.withObject "Position" $ \position ->
+    do  row <- position .: "line" :: Aeson.Parser Int
+        column <- position .: "character" :: Aeson.Parser Int
 
+        return $ A.Position (fromIntegral row + 1) (fromIntegral column + 1)
+
+
+parseRange :: Aeson.Value -> Aeson.Parser (A.Position, A.Position)
+parseRange =
+  Aeson.withObject "Range" $ \obj ->
+    do  start <- parsePosition =<< obj .: "start"
+        end <- parsePosition =<< obj .: "end"
+
+        return (start, end)
+
+
+parseTextDocumentContentChangeEvent :: Aeson.Value -> Aeson.Parser ((A.Position, A.Position), String)
+parseTextDocumentContentChangeEvent =
+  Aeson.withObject "TextDocumentContentChangeEvent" $ \obj ->
+    do  range <- parseRange =<< obj .: "range"
+        text <- obj .: "text"
+
+        return (range, text)
+
+
+applyChanges :: [((A.Position, A.Position), String)] -> String -> String
+applyChanges changes content =
+  List.foldl' (\acc ((start, end), newText) -> applyChange acc start end newText) content changes
+
+
+applyChange :: String -> A.Position -> A.Position -> String -> String
+applyChange content (A.Position sr sc) (A.Position er ec) newText =
+  let lines_ = lines content
+      (before, rest) = splitAt (fromIntegral sr - 1) lines_
+      (startTargetLine:afterStart) = rest
+
+      endRest = drop (fromIntegral er - fromIntegral sr) rest
+      (endTargetLine:afterEnd) = endRest
+
+      (start, _) = splitAt (fromIntegral sc - 1) startTargetLine
+      (_, end) = splitAt (fromIntegral ec - 1) endTargetLine
+
+      updatedLine = start ++ newText ++ end
+  in unlines $ before ++ (updatedLine : afterEnd)
 
 
 readHeader :: IO Int
@@ -289,6 +438,9 @@ data DefinitionExit
   | DefinitionExitNoRoot
   | DefinitionExitNotFound DefinedEntity
   | DefinitionExitNoDefinedEntity
+  | DefinitionExitModuleNotFound ModuleName.Raw
+  | DefinitionExitNoProperModName DefinedEntity
+
 
 definitionExitToReport :: FilePath -> DefinitionExit -> Reporting.Exit.Help.Report
 definitionExitToReport path exit =
@@ -309,6 +461,7 @@ definitionExitToReport path exit =
         ]
 
     DefinitionExitNotFound entity ->
+      -- FIXME: Add info about where looked for the definition in?
       Reporting.Exit.Help.report "NO DEFINITION" Nothing
         ("I tried to find the definition for " ++ definedEntityToStr entity ++ ", but failed to find it.")
         []
@@ -318,9 +471,19 @@ definitionExitToReport path exit =
         "I tried to find a defined entity under the cursor, but could not."
         []
 
+    DefinitionExitModuleNotFound moduleName ->
+      Reporting.Exit.Help.report "NO FILE FOR MODULE" Nothing
+        ("I tried to find the file for " ++ ModuleName.toChars moduleName ++ ", but failed to find it.")
+        []
 
-findDefinition :: FilePath -> A.Position -> Task.Task DefinitionExit (FilePath, A.Region)
-findDefinition filePath position =
+    DefinitionExitNoProperModName entity ->
+      Reporting.Exit.Help.report "NO PROPER MODULE NAME" Nothing
+        ("I tried to find the definition for " ++ definedEntityToStr entity ++ ", but failed to find it.")
+        []
+
+
+findDefinition :: State -> FilePath -> A.Position -> Task.Task DefinitionExit (FilePath, A.Region)
+findDefinition state filePath position =
   Task.eio id $ BW.withScope $ \scope -> Task.run $
   do  maybeRoot <- Task.io $ Dir.withCurrentDirectory (Path.takeDirectory filePath) Stuff.findRoot
       case maybeRoot of
@@ -336,24 +499,35 @@ findDefinition filePath position =
               details <-
                 Task.eio DefinitionExitBadDetails $ Details.load Reporting.silent scope root
 
-              source <-
-                Task.io $ File.readUtf8 filePath
+              files <- Task.io $ Control.Concurrent.MVar.readMVar (_changedFiles state)
 
-              srcModule <-
+              source <-
+                maybe (Task.io $ File.readUtf8 filePath) return $
+                  (fmap BSC.pack $ Map.lookup filePath files)
+
+              srcModule@(Src.Module _ _ _ imports_ _ _ _ _ _) <-
                 Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
                   return (Parse.fromByteString Parse.Application source)
 
               definedEntity <- maybe (Task.throw DefinitionExitNoDefinedEntity) return $
                 findDefinedEntityInValues position srcModule
 
-              region <- maybe (Task.throw $ DefinitionExitNotFound definedEntity) return $
-                findDefinitionForDefinedEntity srcModule definedEntity
+              let localDefinition = fmap (\a -> (filePath, a)) $ findDefinitionForDefinedEntity srcModule definedEntity
 
-              pure (filePath, region)
+              externalDefinition <- case definedEntity of
+                DEVar _ _ Src.LowVar name ->
+                  findDefinitionForLowVarInImports state details imports_ name
+                DEVarQual _ _ Src.LowVar mod name ->
+                  findDefinitionForLowVarQualInImports state details imports_ mod name
+                _ ->
+                  return Nothing
+
+              maybe (Task.throw $ DefinitionExitNotFound definedEntity) return $
+                (localDefinition <|> externalDefinition)
 
 
 findDefinitionForDefinedEntity :: Src.Module -> DefinedEntity -> Maybe A.Region
-findDefinitionForDefinedEntity (Src.Module name exports docs imports values unions alias infixes effects) definedEntity =
+findDefinitionForDefinedEntity (Src.Module moduleName exports docs imports values unions alias infixes effects) definedEntity =
   case definedEntity of
     DEVar defs patterns Src.LowVar name ->
       let
@@ -384,13 +558,112 @@ findDefinitionForDefinedEntity (Src.Module name exports docs imports values unio
       Nothing
 
 
+findDefinitionForLowVarQualInImports ::
+  State
+  -> Details.Details
+  -> [Src.Import]
+  -> Name
+  -> Name
+  -> Task.Task DefinitionExit (Maybe (FilePath, A.Region))
+findDefinitionForLowVarQualInImports state details imports qual name =
+  let
+    potentialSources =
+      foldr
+        (\import_@(Src.Import iName iAlias iExposing) acc ->
+          if A.toValue iName == qual || Just qual == iAlias then import_ : acc else acc
+        )
+        []
+        imports
+  in
+  foldr
+    (\import_ acc ->
+      do  x <- findDefinitionForNameInModule state details (Src.getImportName import_) name
+          y <- acc
+          return (x <|> y)
+    )
+    (return Nothing)
+    potentialSources
+
+
+findDefinitionForLowVarInImports ::
+  State
+  -> Details.Details
+  -> [Src.Import]
+  -> Name
+  -> Task.Task DefinitionExit (Maybe (FilePath, A.Region))
+findDefinitionForLowVarInImports state details imports name =
+  let
+    potentialSources =
+      foldr
+        (\import_@(Src.Import iName iAlias iExposing) acc ->
+          case iExposing of
+            Src.Open -> import_ : acc
+            Src.Explicit exposed -> foldr (\exposed _ ->
+                case exposed of
+                  Src.Lower (A.At _ name_) -> if name_ == name then [import_] else acc
+                  Src.Upper _ _ -> acc
+                  Src.Operator _ _ -> acc
+              )
+              []
+              exposed
+        )
+        []
+        imports
+  in
+  foldr
+    (\import_ acc ->
+      do  x <- findDefinitionForNameInModule state details (Src.getImportName import_) name
+          y <- acc
+          return (x <|> y)
+    )
+    (return Nothing)
+    potentialSources
+
+
+findDefinitionForNameInModule ::
+  State
+  -> Details.Details
+  -> ModuleName.Raw
+  -> Name
+  -> Task.Task DefinitionExit (Maybe (FilePath, A.Region))
+findDefinitionForNameInModule state details moduleName name =
+  do  files <- Task.io $ Control.Concurrent.MVar.readMVar (_changedFiles state)
+
+      filePath <- maybe (Task.throw (DefinitionExitModuleNotFound moduleName)) return $
+        (lookupModulePath details moduleName)
+
+      source <-
+        maybe (Task.io $ File.readUtf8 filePath) return $
+          (BSC.pack <$> Map.lookup filePath files)
+
+      srcModule <-
+        Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
+          return (Parse.fromByteString Parse.Application source)
+
+      return (fmap (\a -> (filePath, a)) $ findLowVarDefinitionNamed name srcModule)
+
+
+lookupModulePath :: Details.Details -> ModuleName.Raw -> Maybe FilePath
+lookupModulePath details name =
+  fmap Details._path $ Map.lookup name $ Details._locals details
+
+
+findLowVarDefinitionNamed :: Name -> Src.Module -> Maybe A.Region
+findLowVarDefinitionNamed name (Src.Module _ _ _ _ values _ _ _ _) =
+  foldr (\(A.At _ (Src.Value name_ _ _ _)) acc ->
+      if A.toValue name_ == name then Just (A.toRegion name_) else acc
+    )
+    Nothing
+    values
+
+
 findDefinitionForNameInPattern :: Name -> Src.Pattern -> Maybe A.Region
 findDefinitionForNameInPattern name pattern@(A.At _ pattern_) =
   case pattern_ of
     Src.PVar pname ->
       if pname == name then Just (A.toRegion pattern) else Nothing
-    Src.PRecord names -> foldr (\name_ acc ->
-      if A.toValue name_ == name then Just (A.toRegion name_) else acc) Nothing names
+    Src.PRecord names ->
+      foldr (\(A.At loc name_) acc -> if name_ == name then Just loc else acc) Nothing names
     Src.PAlias aPattern (A.At loc aName) ->
       if aName == name then Just loc else findDefinitionForNameInPattern name aPattern
     Src.PTuple a b c ->
