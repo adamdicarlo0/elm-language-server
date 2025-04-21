@@ -10,6 +10,7 @@ import qualified Control.Concurrent.MVar
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
+import qualified Data.Time
 
 import Data.Foldable (foldrM)
 import qualified Data.ByteString as BS
@@ -21,6 +22,7 @@ import Data.Name (Name)
 import qualified Data.Name as Name
 import qualified Data.Map.Utils as Map
 import qualified Data.Map.Strict as Map
+import qualified Data.Utf8 as Utf8
 
 import qualified System.IO as IO
 import qualified System.Directory as Dir
@@ -44,12 +46,16 @@ import qualified Reporting.Task as Task
 import qualified Reporting.Annotation as A
 
 import qualified Elm.Details as Details
-import qualified Elm.Outline
-import qualified BackgroundWriter as BW
+import qualified Elm.Outline as Outline
+import qualified Elm.Version as Version
+import qualified Elm.Package as Pkg
+import qualified Deps.Registry
+
 
 import qualified AST.Source as Src
 import qualified Elm.ModuleName as ModuleName
 
+import qualified BackgroundWriter as BW
 
 newtype State = State
   { _changedFiles :: Control.Concurrent.MVar.MVar (Map.Map FilePath String)
@@ -120,7 +126,7 @@ run = do
 
                           sendCreateWorkDoneProgress "initialization-progress"
                           sendProgressBegin "initialization-progress" "Discovering projects"
-                          sendProgressEnd "initialization-progress"
+                          sendProgressEnd "initialization-progress" "Done"
 
                           loop state
 
@@ -155,7 +161,6 @@ run = do
 
                           loop state
 
-
             Right "textDocument/didClose" ->
               do  let result =
                         Aeson.parseEither (\obj ->
@@ -183,7 +188,6 @@ run = do
                           IO.hPutStr IO.stderr $ "open: put mvar"
 
                           loop state
-
 
             Right "textDocument/didChange" ->
               do  let result =
@@ -213,7 +217,6 @@ run = do
 
                            loop state
 
-
             Right "textDocument/definition" ->
               do  let result =
                         Aeson.parseEither (\obj ->
@@ -241,7 +244,15 @@ run = do
                           loop state
 
                     Right (id, filePath, position) ->
-                      do  result <- Task.run $ findDefinition state filePath position
+                      do  sendCreateWorkDoneProgress "go-to-definition-progress"
+                          sendProgressBegin "go-to-definition-progress" "👀 Finding definition..."
+
+                          startTime <- Data.Time.getCurrentTime
+                          result <- Task.run $ findDefinition state filePath position
+                          endTime <- Data.Time.getCurrentTime
+
+                          sendProgressEnd "go-to-definition-progress" $
+                             "Finding definition took " ++ show (Data.Time.diffUTCTime endTime startTime)
 
                           case result of
                             Right (definitionFilePath, region) ->
@@ -249,14 +260,8 @@ run = do
                                   loop state
 
                             Left err ->
-                              do  showMessage MessageTypeError $
-                                    Reporting.Exit.toString $
+                              do  respondErr id $ Reporting.Exit.toString $
                                     definitionExitToReport filePath err
-
-                                  IO.hSetBuffering IO.stderr IO.NoBuffering
-                                  Reporting.Exit.toStderr $ definitionExitToReport filePath err
-                                  IO.hFlush IO.stderr
-                                  IO.hSetBuffering IO.stderr (IO.BlockBuffering Nothing)
                                   loop state
 
             Right unknownMethod ->
@@ -357,13 +362,27 @@ sendProgressBegin token title = do
     )
 
 
-sendProgressEnd :: String -> IO ()
-sendProgressEnd token = do
+sendProgressReport :: String -> String -> IO ()
+sendProgressReport token message = do
+  sendNotification "$/progress"
+    (Aeson.object
+      [ "token" Aeson..= token
+      , "value" Aeson..= Aeson.object
+        [ "kind" Aeson..= ("report" :: String)
+        , "message" Aeson..= message
+        ]
+      ]
+    )
+
+
+sendProgressEnd :: String -> String -> IO ()
+sendProgressEnd token message = do
   sendNotification "$/progress"
     (Aeson.object
       [ "token" Aeson..= token
       , "value" Aeson..= Aeson.object
         [ "kind" Aeson..= ("end" :: String)
+        , "message" Aeson..= message
         ]
       ]
     )
@@ -376,6 +395,22 @@ sendNotification method value =
     content = BSLC.toStrict $ Aeson.encode $ Aeson.object
       [ "method" .= method
       , "params" .= value
+      ]
+   in do
+   BSC.hPutStr IO.stdout (BSC.pack header `BSC.append` content)
+   IO.hFlush IO.stdout
+
+
+respondErr :: Int -> String -> IO ()
+respondErr idValue message =
+  let
+    header = "Content-Length: " ++ show (BSC.length content) ++ "\r\n\r\n"
+    content = BSLC.toStrict $ Aeson.encode $ Aeson.object
+      [ "id" Aeson..= idValue
+      , "error" Aeson..= Aeson.object
+        [ "code" Aeson..= (-1 :: Int) -- FIXME: remove code?
+        , "message" Aeson..= (message :: String)
+        ]
       ]
    in do
    BSC.hPutStr IO.stdout (BSC.pack header `BSC.append` content)
@@ -505,12 +540,22 @@ findDefinition state filePath position =
                 maybe (Task.io $ File.readUtf8 filePath) return $
                   (fmap BSC.pack $ Map.lookup filePath files)
 
+              let projectType =
+                    case Details._outline details of
+                      Details.ValidApp _ -> Parse.Application
+                      Details.ValidPkg pkgName _ _ -> Parse.Package pkgName
+
               srcModule@(Src.Module _ _ _ imports_ _ _ _ _ _) <-
                 Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
-                  return (Parse.fromByteString Parse.Application source)
+                  return (Parse.fromByteString projectType source)
 
               definedEntity <- maybe (Task.throw DefinitionExitNoDefinedEntity) return $
                 findDefinedEntityInValues position srcModule
+
+              let row = ((\(A.Position row _) -> row) position)
+
+              _ <- Task.io $ sendProgressReport "go-to-definition-progress" $
+                     "Entity: " ++ definedEntityToStr definedEntity
 
               let localDefinition = fmap (\a -> (filePath, a)) $ findDefinitionForDefinedEntity srcModule definedEntity
 
@@ -629,23 +674,62 @@ findDefinitionForNameInModule ::
 findDefinitionForNameInModule state details moduleName name =
   do  files <- Task.io $ Control.Concurrent.MVar.readMVar (_changedFiles state)
 
-      filePath <- maybe (Task.throw (DefinitionExitModuleNotFound moduleName)) return $
-        (lookupModulePath details moduleName)
+      pkgPath <- Task.io (lookupPkgPath details moduleName)
+
+      (projectType, filePath) <-
+        Task.mio (DefinitionExitModuleNotFound moduleName) $
+          (do  let local = fmap (\a -> (Parse.Application, a)) (lookupModulePath details moduleName)
+               pkg <- fmap (\a -> (,) <$> fmap Parse.Package (lookupPkgName details moduleName) <*> a)
+                  (lookupPkgPath details moduleName)
+
+               return (local <|> pkg)
+          )
 
       source <-
         maybe (Task.io $ File.readUtf8 filePath) return $
           (BSC.pack <$> Map.lookup filePath files)
 
-      srcModule <-
-        Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
-          return (Parse.fromByteString Parse.Application source)
+      -- Check if file contains the val at all before parsing, which is more
+      -- expensive if the file is massive.
+      -- TODO: do not parse for definition either? :D
+      let sourceContainsVal = any (BSC.isPrefixOf (BSC.pack (Name.toChars name ++ " "))) (BSC.lines source)
 
-      return (fmap (\a -> (filePath, a)) $ findLowVarDefinitionNamed name srcModule)
+      if sourceContainsVal then
+        do  srcModule <-
+              Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
+                return (Parse.fromByteString projectType source)
+
+            return (fmap (\a -> (filePath, a)) $ findLowVarDefinitionNamed name srcModule)
+      else
+        return Nothing
+
+lookupPkgPath :: Details.Details -> ModuleName.Raw -> IO (Maybe FilePath)
+lookupPkgPath details moduleName =
+  case lookupPkgName details moduleName of
+    Nothing -> pure Nothing
+    Just pkgName ->
+      do  maybeCurrentVersion <- getPackageCurrentlyUsedOrLatestVersion "." pkgName
+
+          case maybeCurrentVersion of
+            Nothing -> pure Nothing
+            Just version ->
+              do  packageCache <- Stuff.getPackageCache
+                  let home = Stuff.package packageCache pkgName version
+                  let path = home Path.</> "src" Path.</> ModuleName.toFilePath moduleName Path.<.>"elm"
+
+                  return (Just path)
 
 
 lookupModulePath :: Details.Details -> ModuleName.Raw -> Maybe FilePath
 lookupModulePath details name =
   fmap Details._path $ Map.lookup name $ Details._locals details
+
+
+lookupPkgName :: Details.Details -> ModuleName.Raw -> Maybe Pkg.Name
+lookupPkgName details canModuleName =
+  fmap (\(Details.Foreign name_ _) -> name_) $
+    Map.lookup canModuleName $
+    Details._foreigns details
 
 
 findLowVarDefinitionNamed :: Name -> Src.Module -> Maybe A.Region
@@ -687,9 +771,9 @@ data DefinedEntity
 definedEntityToStr :: DefinedEntity -> String
 definedEntityToStr entity =
   case entity of
-    DEVar _ _ _ name -> "var: " ++ Name.toChars name
-    DEVarQual _ _ _ prefix name -> "qualified var: " ++ Name.toChars prefix ++ " " ++ Name.toChars name
-    DEAccess _ _ record field -> "access: " ++ Name.toChars field
+    DEVar _ _ _ name -> Name.toChars name
+    DEVarQual _ _ _ prefix name -> Name.toChars prefix ++ "." ++ Name.toChars name
+    DEAccess _ _ record field -> "." ++ Name.toChars field
 
 
 findDefinedEntityInValues :: A.Position -> Src.Module -> Maybe DefinedEntity
@@ -901,3 +985,41 @@ findDefinedEntityInExpr position defs patterns expr =
     Src.Shader _ _ ->
       Nothing
 
+
+
+-- PACKAGE
+
+
+getPackageCurrentlyUsedOrLatestVersion :: FilePath -> Pkg.Name -> IO (Maybe Version.Version)
+getPackageCurrentlyUsedOrLatestVersion rootDir packageName =
+  do  eitherOutline <- Outline.read rootDir
+      case eitherOutline of
+        Left err -> getPackageNewestVersionFromRegistry packageName
+
+        Right (Outline.App appOutline) ->
+          let maybeLocal =
+                Map.lookup packageName (Outline._app_deps_direct appOutline)
+                  <|> Map.lookup packageName (Outline._app_deps_indirect appOutline)
+                  <|> Map.lookup packageName (Outline._app_test_direct appOutline)
+                  <|> Map.lookup packageName (Outline._app_test_indirect appOutline)
+          in
+          case maybeLocal of
+            Nothing -> getPackageNewestVersionFromRegistry packageName
+            Just found -> pure maybeLocal
+
+        Right (Outline.Pkg _) ->
+          getPackageNewestVersionFromRegistry packageName
+
+
+getPackageNewestVersionFromRegistry packageName =
+  do  packageCache <- Stuff.getPackageCache
+      maybeRegistry <- Deps.Registry.read packageCache
+
+      case maybeRegistry of
+        Nothing ->
+          pure Nothing
+
+        Just registry ->
+          case Map.lookup packageName (Deps.Registry._versions registry) of
+            Nothing -> pure Nothing
+            Just knownVersions -> pure (Just (Deps.Registry._newest knownVersions))
