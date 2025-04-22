@@ -549,58 +549,56 @@ findDefinition state filePath position =
                 Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
                   return (Parse.fromByteString projectType source)
 
-              definedEntity <- maybe (Task.throw DefinitionExitNoDefinedEntity) return $
+              entity <- maybe (Task.throw DefinitionExitNoDefinedEntity) return $
                 findDefinedEntityInValues position srcModule
 
               let row = ((\(A.Position row _) -> row) position)
 
               _ <- Task.io $ sendProgressReport "go-to-definition-progress" $
-                     "Entity: " ++ definedEntityToStr definedEntity
+                     "Entity: " ++ definedEntityToStr entity
 
-              let localDefinition = fmap (\a -> (filePath, a)) $ findDefinitionForDefinedEntity srcModule definedEntity
+              case entity of
+                DEVar defs patterns Src.LowVar name ->
+                  do  let local = fmap (\a -> (filePath, a)) $ 
+                                    findDefinitionForLowVarLocally srcModule defs patterns name
+                      external <- findDefinitionForLowVarInImports state details imports_ name
 
-              externalDefinition <- case definedEntity of
-                DEVar _ _ Src.LowVar name ->
-                  findDefinitionForLowVarInImports state details imports_ name
+                      return (local <|> external)
+                        >>= maybe (Task.throw $ DefinitionExitNotFound entity) return
+
                 DEVarQual _ _ Src.LowVar mod name ->
                   findDefinitionForLowVarQualInImports state details imports_ mod name
+                    >>= maybe (Task.throw $ DefinitionExitNotFound entity) return
+
                 _ ->
-                  return Nothing
-
-              maybe (Task.throw $ DefinitionExitNotFound definedEntity) return $
-                (localDefinition <|> externalDefinition)
+                  Task.throw $ DefinitionExitNotFound entity
 
 
-findDefinitionForDefinedEntity :: Src.Module -> DefinedEntity -> Maybe A.Region
-findDefinitionForDefinedEntity (Src.Module moduleName exports docs imports values unions alias infixes effects) definedEntity =
-  case definedEntity of
-    DEVar defs patterns Src.LowVar name ->
-      let
-        inDefs =
-          foldr
-            (\(A.At _ def) acc ->
-              case def of
-                (Src.Define (A.At region valueName) _ _ _) -> if valueName == name then Just region else acc
-                (Src.Destruct pattern _) -> findDefinitionForNameInPattern name pattern
-            )
-            Nothing
-            defs
+findDefinitionForLowVarLocally :: Src.Module -> [A.Located Src.Def] -> [Src.Pattern] -> Name -> Maybe A.Region
+findDefinitionForLowVarLocally (Src.Module _ _ _ _ values _ _ _ _) defs patterns name =
+  let
+    inDefs =
+      foldr
+        (\(A.At _ def) acc ->
+          case def of
+            (Src.Define (A.At region valueName) _ _ _) -> if valueName == name then Just region else acc
+            (Src.Destruct pattern _) -> findDefinitionForNameInPattern name pattern
+        )
+        Nothing
+        defs
 
-        inPatterns =
-          foldr (\p acc -> findDefinitionForNameInPattern name p <|> acc) Nothing patterns
+    inPatterns =
+      foldr (\p acc -> findDefinitionForNameInPattern name p <|> acc) Nothing patterns
 
-        inValues =
-          foldr
-            (\(A.At _ (Src.Value (A.At region valueName) _ _ _)) acc ->
-              if valueName == name then Just region else acc
-            )
-            Nothing
-            values
-      in
-      inDefs <|> inPatterns <|> inValues
-
-    _ ->
-      Nothing
+    inValues =
+      foldr
+        (\(A.At _ (Src.Value (A.At region valueName) _ _ _)) acc ->
+          if valueName == name then Just region else acc
+        )
+        Nothing
+        values
+  in
+  inDefs <|> inPatterns <|> inValues
 
 
 findDefinitionForLowVarQualInImports ::
