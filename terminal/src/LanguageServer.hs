@@ -52,11 +52,12 @@ import qualified Elm.Version as Version
 import qualified Elm.Package as Pkg
 import qualified Deps.Registry
 
-
 import qualified AST.Source as Src
 import qualified Elm.ModuleName as ModuleName
 
 import qualified BackgroundWriter as BW
+
+
 
 newtype State = State
   { _changedFiles :: Control.Concurrent.MVar.MVar (Map.Map FilePath BS.ByteString)
@@ -590,7 +591,10 @@ findDefinition state filePath position =
           Task.eio id $ Stuff.withRootLock root $ Task.run $
 
           do  details <- Task.eio DefinitionExitBadDetails $ Details.load Reporting.silent scope root
-              src <- loadSrcModuleByPath state details filePath
+              src <-
+                case Details._outline details of
+                  Details.ValidApp _ -> loadSrcModuleByPath state filePath
+                  Details.ValidPkg name _ _ -> loadPkgModuleByPath state name filePath
 
               findDefinition_ state details root filePath src position
 
@@ -844,6 +848,7 @@ findLowVarDefinitionNamed name (Src.Module _ _ _ _ values _ _ _ _) =
 findDefinitionForNameInPattern :: Name -> Src.Pattern -> Maybe (A.Region, Src.Pattern_)
 findDefinitionForNameInPattern name pattern@(A.At _ pattern_) =
   case pattern_ of
+    Src.PAnything -> Nothing
     Src.PVar pname ->
       if pname == name then Just (A.toRegion pattern, A.toValue pattern) else Nothing
     Src.PRecord names ->
@@ -853,16 +858,19 @@ findDefinitionForNameInPattern name pattern@(A.At _ pattern_) =
         Just (loc, pattern_)
       else
         findDefinitionForNameInPattern name aPattern
+    Src.PUnit -> Nothing
     Src.PTuple a b c ->
       foldr (\p acc -> findDefinitionForNameInPattern  name p <|> acc) Nothing (a : b : c)
+    Src.PCtor _ _ args ->
+      foldr (\p acc -> findDefinitionForNameInPattern name p <|> acc) Nothing args
+    Src.PCtorQual _ _ _ _ -> Nothing
     Src.PList patterns ->
       foldr (\p acc -> findDefinitionForNameInPattern name p <|> acc) Nothing patterns
     Src.PCons a b ->
       findDefinitionForNameInPattern name a <|> findDefinitionForNameInPattern name b
-    Src.PCtor _ _ args ->
-      foldr (\p acc -> findDefinitionForNameInPattern name p <|> acc) Nothing args
-    _ ->
-      Nothing
+    Src.PChr _ -> Nothing
+    Src.PStr _ -> Nothing
+    Src.PInt _ -> Nothing
 
 
 data DefinedEntity
@@ -1111,14 +1119,18 @@ findReferences state filePath position =
           do  details <-
                 Task.eio DefinitionExitBadDetails $ Details.load Reporting.silent scope root
 
-              localSrc <- loadSrcModuleByPath state details filePath
+              localSrc <-
+                case Details._outline details of
+                  Details.ValidApp _ -> loadSrcModuleByPath state filePath
+                  Details.ValidPkg name _ _ -> loadPkgModuleByPath state name filePath
+
               definition <- findDefinition_ state details root filePath localSrc position
 
               case definition of
                 (modulePath, defSrc, A.At defRegion (FoundValue value@(Src.Value name _ _ _))) ->
                   do  let importers = importersOf details (Src.getName defSrc)
 
-                      let localRefs = map (\a -> (modulePath, a)) (varInModule (A.toValue name) localSrc)
+                      let localRefs = map (\a -> (modulePath, a)) (varInModule (A.toValue name) defSrc)
 
                       foldr
                         (\a acc ->
@@ -1130,7 +1142,7 @@ findReferences state filePath position =
                                     case List.find (\a -> A.toValue (Src._import a) == Src.getName defSrc) (Src._imports importerSrc) of
                                       Just import_@(Src.Import _ alias _) ->
                                         if isLowVarExposed import_ (A.toValue name)
-                                          then varInModule (A.toValue name) importerSrc
+                                          then varInModule (A.toValue name) importerSrc ++ varQualInModule (Maybe.fromMaybe (Src.getImportName import_) alias) (A.toValue name) importerSrc
                                           else varQualInModule (Maybe.fromMaybe (Src.getImportName import_) alias) (A.toValue name) importerSrc
 
                                       Nothing -> []
@@ -1175,12 +1187,27 @@ loadSrcModule state details root moduleName =
 
       (projectType, filePath) <-
         Task.mio (DefinitionExitModuleNotFound root moduleName) $
-          (do  let local = fmap (\a -> (Parse.Application, a)) (lookupModulePath details moduleName)
-               pkg <- fmap (\a -> (,) <$> fmap Parse.Package (lookupPkgName details moduleName) <*> a)
-                  (lookupPkgPath details moduleName)
+          case Details._outline details of
+            Details.ValidApp _ ->
+              do  let local = lookupModulePath details moduleName
+                  let pkgName = lookupPkgName details moduleName
 
-               return (local <|> pkg)
-          )
+                  pkg <- lookupPkgPath details moduleName
+
+                  return
+                    ((fmap (\a -> (Parse.Application, a)) local)
+                      <|> ((,) <$> fmap Parse.Package pkgName <*> pkg)
+                    )
+
+            Details.ValidPkg pkgName _ _ ->
+              do  let local = lookupModulePath details moduleName
+                  let pkgName_ = lookupPkgName details moduleName
+                  pkg <- lookupPkgPath details moduleName
+
+                  return
+                    ((fmap (\a -> (Parse.Package pkgName, a)) local)
+                      <|> ((,) <$> fmap Parse.Package pkgName_ <*> pkg)
+                    )
 
       source <-
         maybe (Task.io $ File.readUtf8 filePath) return $
@@ -1190,21 +1217,28 @@ loadSrcModule state details root moduleName =
         return (fmap ((,) filePath) (Parse.fromByteString projectType source))
 
 
-loadSrcModuleByPath :: State -> Details.Details -> FilePath -> Task.Task DefinitionExit Src.Module
-loadSrcModuleByPath state details filePath =
+loadSrcModuleByPath :: State -> FilePath -> Task.Task DefinitionExit Src.Module
+loadSrcModuleByPath state filePath =
   do  files <- Task.io $ Control.Concurrent.MVar.readMVar (_changedFiles state)
 
       source <-
         maybe (Task.io $ File.readUtf8 filePath) return $
           Map.lookup filePath files
 
-      let projectType =
-            case Details._outline details of
-              Details.ValidApp _ -> Parse.Application
-              Details.ValidPkg pkgName _ _ -> Parse.Package pkgName
+      Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
+        return (Parse.fromByteString Parse.Application source)
+
+
+loadPkgModuleByPath :: State -> Pkg.Name -> FilePath -> Task.Task DefinitionExit Src.Module
+loadPkgModuleByPath state pkgName filePath =
+  do  files <- Task.io $ Control.Concurrent.MVar.readMVar (_changedFiles state)
+
+      source <-
+        maybe (Task.io $ File.readUtf8 filePath) return $
+          (Map.lookup filePath files)
 
       Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
-        return (Parse.fromByteString projectType source)
+        return (Parse.fromByteString (Parse.Package pkgName) source)
 
 
 isLowVarExposed :: Src.Import -> Name -> Bool
@@ -1235,8 +1269,7 @@ isInfixExposed (Src.Import _ _ (Src.Explicit exposing)) name =
 
 importersOf :: Details.Details -> ModuleName.Raw -> Set.Set ModuleName.Raw
 importersOf details targetModule =
-  let locals = Details._locals details
-  in
+  let locals = Details._locals details in
   Map.foldrWithKey
     (\localModuleName localDetails found ->
       if List.elem targetModule (Details._deps localDetails)
@@ -1250,8 +1283,10 @@ importersOf details targetModule =
 varInModule :: Name -> Src.Module -> [A.Region]
 varInModule name srcMod@(Src.Module _ _ _ imports values _ _ _ _) =
     List.concatMap
-      (\(A.At _ (Src.Value _ _ expr _)) ->
-        varInExpr name [] expr
+      (\(A.At _ val@(Src.Value _ patterns expr _)) ->
+        if any (Maybe.isJust . findDefinitionForNameInPattern name) patterns
+          then []
+          else varInExpr name [] expr
       )
       values
 
@@ -1269,42 +1304,58 @@ varInExpr name foundRegions (A.At region expr_) =
         Src.Op _ -> foundRegions
         Src.Negate expr -> varInExpr name foundRegions expr
         Src.Binops exprsAndNames expr ->
-            List.foldl
-                (\foundRegions (expr_, _) -> varInExpr name foundRegions expr_)
-                (varInExpr name foundRegions expr)
-                exprsAndNames
-        Src.Lambda patterns expr -> varInExpr name foundRegions expr
+          List.foldl
+            (\foundRegions (expr_, _) -> varInExpr name foundRegions expr_)
+            (varInExpr name foundRegions expr)
+            exprsAndNames
+        Src.Lambda patterns expr ->
+          if any (Maybe.isJust . findDefinitionForNameInPattern name) patterns
+            then foundRegions
+            else varInExpr name foundRegions expr
         Src.Call expr exprs ->
-            List.foldl
-                (varInExpr name)
-                (varInExpr name foundRegions expr)
-                exprs
+          List.foldl
+            (varInExpr name)
+            (varInExpr name foundRegions expr)
+            exprs
         Src.If listTupleExprs expr ->
-            List.foldl
-                (\foundRegions (one, two) ->
-                    varInExpr name (varInExpr name foundRegions one) two
-                )
-                (varInExpr name foundRegions expr)
-                listTupleExprs
+          List.foldl
+            (\foundRegions (one, two) ->
+              varInExpr name (varInExpr name foundRegions one) two
+            )
+            (varInExpr name foundRegions expr)
+            listTupleExprs
         Src.Let defs expr ->
-            List.foldl
-                (\foundRegions (A.At _ def_) ->
-                    case def_ of
-                        Src.Define (A.At _ name_) _ expr_ _ ->
-                            varInExpr name foundRegions expr_
-
-                        Src.Destruct pattern expr_ ->
-                            varInExpr name foundRegions expr_
+          let
+            isNameInDefs =
+              any
+                (\a ->
+                  case A.toValue a of
+                    Src.Define (A.At _ name_) _ _ _ -> name == name_
+                    Src.Destruct pattern _ ->
+                      Maybe.isJust (findDefinitionForNameInPattern name pattern)
                 )
-                (varInExpr name foundRegions expr)
-                defs
+              defs
+          in
+          if isNameInDefs then
+            foundRegions
+          else
+            List.foldl
+              (\foundRegions (A.At _ def_) ->
+                case def_ of
+                  Src.Define (A.At _ name_) _ expr_ _ -> varInExpr name foundRegions expr_
+                  Src.Destruct pattern expr_ -> varInExpr name foundRegions expr_
+              )
+              (varInExpr name foundRegions expr)
+              defs
         Src.Case expr branches ->
-            List.foldl
-                (\foundRegions (pattern, branchExpr) ->
-                    varInExpr name (varInExpr name foundRegions branchExpr) expr
-                )
-                (varInExpr name foundRegions expr)
-                branches
+          if any (Maybe.isJust . findDefinitionForNameInPattern name . fst) branches
+            then foundRegions
+            else List.foldl
+              (\foundRegions (pattern, branchExpr) ->
+                varInExpr name (varInExpr name foundRegions branchExpr) expr
+              )
+              (varInExpr name foundRegions expr)
+              branches
         Src.Accessor _ -> foundRegions
         Src.Access expr _ -> varInExpr name foundRegions expr
         Src.Update _ fields ->
@@ -1375,7 +1426,7 @@ varQualInExpr qual name foundRegions (A.At region expr_) =
                         Src.Destruct pattern expr_ ->
                             varQualInExpr qual name foundRegions expr_
                 )
-                (varInExpr name foundRegions expr)
+                (varQualInExpr qual name foundRegions expr)
                 defs
         Src.Case expr branches ->
             List.foldl
@@ -1401,6 +1452,7 @@ varQualInExpr qual name foundRegions (A.At region expr_) =
             List.foldl (varQualInExpr qual name) foundRegions (exprA : exprB : exprs)
         Src.Shader _ _ -> foundRegions
 
+
 infixInModule :: Name -> Src.Module -> [A.Region]
 infixInModule name srcMod@(Src.Module _ _ _ imports values _ _ _ _) =
     List.concatMap
@@ -1424,8 +1476,8 @@ infixInExpr name foundRegions (A.At region expr_) =
         Src.Negate expr -> infixInExpr  name foundRegions expr
         Src.Binops exprsAndNames expr ->
             List.foldl
-                (\foundRegions (expr_, (A.At region name_)) -> 
-                  if name == name_ then 
+                (\foundRegions (expr_, (A.At region name_)) ->
+                  if name == name_ then
                     infixInExpr name (region : foundRegions) expr_
                   else
                     infixInExpr name foundRegions expr_
@@ -1458,7 +1510,7 @@ infixInExpr name foundRegions (A.At region expr_) =
                 (\foundRegions (pattern, branchExpr) ->
                     infixInExpr name (infixInExpr name foundRegions branchExpr) expr
                 )
-                (varInExpr name foundRegions expr)
+                (infixInExpr name foundRegions expr)
                 branches
         Src.Accessor _ -> foundRegions
         Src.Access expr _ -> infixInExpr name foundRegions expr
@@ -1478,6 +1530,8 @@ infixInExpr name foundRegions (A.At region expr_) =
                 foundRegions
                 (exprA : exprB : exprs)
         Src.Shader _ _ -> foundRegions
+
+
 
 -- PACKAGE
 
