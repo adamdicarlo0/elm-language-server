@@ -11,6 +11,7 @@ import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.Time
+import qualified Data.Bifunctor
 
 import Data.Foldable (foldrM)
 import qualified Data.ByteString as BS
@@ -245,7 +246,7 @@ run = do
                           sendProgressBegin "go-to-definition-progress" "👀 Finding definition"
 
                           startTime <- Data.Time.getCurrentTime
-                          result <- Task.run $ findDefinition state filePath position
+                          result <- findDefinition state filePath position
                           endTime <- Data.Time.getCurrentTime
 
                           sendProgressEnd "go-to-definition-progress" $
@@ -579,24 +580,30 @@ findDefinition ::
   State
   -> FilePath
   -> A.Position
-  -> Task.Task DefinitionExit (FilePath, Src.Module, Found)
+  -> IO (Either DefinitionExit (FilePath, Src.Module, Found))
 findDefinition state filePath position =
-  Task.eio id $ BW.withScope $ \scope -> Task.run $
-  do  maybeRoot <- Task.io $ Dir.withCurrentDirectory (Path.takeDirectory filePath) Stuff.findRoot
+  BW.withScope $ \scope ->
+  do  maybeRoot <- Dir.withCurrentDirectory (Path.takeDirectory filePath) Stuff.findRoot
+
       case maybeRoot of
         Nothing ->
-          Task.throw DefinitionExitNoRoot
+          return (Left DefinitionExitNoRoot)
 
         Just root ->
-          Task.eio id $ Stuff.withRootLock root $ Task.run $
+          Stuff.withRootLock root $
+          do  details <- Details.load Reporting.silent scope root
 
-          do  details <- Task.eio DefinitionExitBadDetails $ Details.load Reporting.silent scope root
-              src <-
-                case Details._outline details of
-                  Details.ValidApp _ -> loadSrcModuleByPath state filePath
-                  Details.ValidPkg name _ _ -> loadPkgModuleByPath state name filePath
+              case details of
+                Left exit -> return $ Left $ DefinitionExitBadDetails exit
+                Right details_ ->
+                  do  src <-
+                        case Details._outline details_ of
+                          Details.ValidApp _ -> loadSrcModuleByPath state filePath
+                          Details.ValidPkg name _ _ -> loadPkgModuleByPath state name filePath
 
-              findDefinition_ state details root filePath src position
+                      case src of
+                        Left exit_ -> return $ Left exit_
+                        Right src_ -> findDefinition_ state details_ root filePath src_ position
 
 
 
@@ -607,40 +614,72 @@ findDefinition_ ::
   -> FilePath
   -> Src.Module
   -> A.Position
-  -> Task.Task DefinitionExit (FilePath, Src.Module, Found)
+  -> IO (Either DefinitionExit (FilePath, Src.Module, Found))
 findDefinition_ state details root path src position =
-    do  entity <- maybe (Task.throw DefinitionExitNoDefinedEntity) return $
-          findDefinedEntityInValues position src
+    let entity =
+          maybe (Left DefinitionExitNoDefinedEntity) (\a -> Right a) $
+            findDefinedEntityInValues position src
 
-        let row = ((\(A.Position row _) -> row) position)
+        row = ((\(A.Position row _) -> row) position)
 
-        case entity of
-          DEVar defs patterns Src.LowVar name ->
-            do  let local = fmap (\a -> (path, src, a)) $
-                              findDefinitionForLowVarLocally src defs patterns name
-                -- FIXME: the <|> thing doesn't work here actually, not lazy eval.
-                -- external is actually evaluated and will cause the rest of the task to fail!
-                --
-                -- edit: a day or so later, I don't know what this means anymore. How would I test it?
-                external <- findDefinitionForLowVarInImports state details root (Src._imports src) name
+    in
+    case entity of
+      Right entity_@(DEVar defs patterns Src.LowVar name) ->
+        -- FIXME: first found exposed low var is returned. Which may or may not be
+        -- correct.
+        --
+        --
+        -- Options:
+        --  * return multiple options
+        --  * do what the compiler does - return error
+        --  * ignore; fixing the error in code, solves this problem.
+        --
+        --
+        -- Example (elm-spa-example): Html.Attributes and Html both include a fn
+        -- named `form`. About this, the compiler says:
+        --
+        --
+        -- -- AMBIGUOUS NAME ------------------------------------------- src/Page/Login.elm
+        --
+        --   This usage of `form` is ambiguous:
+        --
+        --   122|     form [ onSubmit SubmittedForm ]
+        --            ^^^^
+        --   This name is exposed by 2 of your imports, so I am not sure which one to use:
+        --
+        --       Html.form
+        --       Html.Attributes.form
+        --
+        --
+        do  let local = findDefinitionForLowVarLocally src defs patterns name
+            external <- findDefinitionForLowVarInImports state details root (Src._imports src) name
 
-                maybe (Task.throw $ DefinitionExitNotFound entity) return $
-                  local <|> fmap (\(a, b, c) -> (a, b, fmap FoundValue c)) external
+            return $
+              case (local, external) of
+                (Just a, _) -> Right (path, src, a)
+                (Nothing, Right (Just a)) -> Right $ (\(a, b, c) -> (a, b, fmap FoundValue c)) a
+                (Nothing, Left a) -> Left a
+                (Nothing, Right Nothing) -> Left (DefinitionExitNotFound entity_)
 
-          DEVarQual _ _ Src.LowVar mod name ->
-            do  imported <- findDefinitionForLowVarQualInImports state details root (Src._imports src) mod name
+      Right entity_@(DEVarQual _ _ Src.LowVar mod name) ->
+       fmap
+         (\a -> a
+           >>= fmap (\(a, b, c) -> (a, b, fmap FoundValue c)) . maybe (Left (DefinitionExitNotFound entity_)) Right
+         )
+         (findDefinitionForLowVarQualInImports state details root (Src._imports src) mod name)
 
-                maybe (Task.throw $ DefinitionExitNotFound entity) return $
-                  fmap (\(a, b, c) -> (a, b, fmap FoundValue c)) imported
+      Right entity_@(DEInfix name_) ->
+        fmap
+          (\a -> a
+            >>= fmap (\(a, b, c) -> (a, b, fmap FoundInfix c)) . maybe (Left (DefinitionExitNotFound entity_)) Right
+          )
+          (findDefinitionForInfixInImports state details root (Src._imports src) name_)
 
-          DEInfix name_ ->
-            do  external <- findDefinitionForInfixInImports state details root (Src._imports src) name_
+      Right entity ->
+        return $ Left $ DefinitionExitNotFound entity
 
-                maybe (Task.throw $ DefinitionExitNotFound entity) return $
-                  fmap (\(a, b, c) -> (a, b, fmap FoundInfix c)) external
-
-          _ ->
-            Task.throw $ DefinitionExitNotFound entity
+      Left exit ->
+        return $ Left exit
 
 
 findDefinitionForLowVarLocally :: Src.Module -> [A.Located Src.Def] -> [Src.Pattern] -> Name -> Maybe Found
@@ -685,7 +724,7 @@ findDefinitionForLowVarQualInImports ::
   -> [Src.Import]
   -> Name
   -> Name
-  -> Task.Task DefinitionExit (Maybe (FilePath, Src.Module, A.Located Src.Value))
+  -> IO (Either DefinitionExit (Maybe (FilePath, Src.Module, A.Located Src.Value)))
 findDefinitionForLowVarQualInImports state details root imports qual name =
   let
     potentialSources =
@@ -699,9 +738,13 @@ findDefinitionForLowVarQualInImports state details root imports qual name =
     (\import_ acc ->
       do  x <- findDefinitionForNameInModule state details root (Src.getImportName import_) name
           y <- acc
-          return (x <|> y)
+
+          case (y, x) of
+            (Left _, x) -> return x
+            (Right Nothing, _) -> return x
+            (Right (Just _), _) -> return y
     )
-    (return Nothing)
+    (return (Right Nothing))
     potentialSources
 
 
@@ -711,7 +754,7 @@ findDefinitionForLowVarInImports ::
   -> FilePath
   -> [Src.Import]
   -> Name
-  -> Task.Task DefinitionExit (Maybe (FilePath, Src.Module, A.Located Src.Value))
+  -> IO (Either DefinitionExit (Maybe (FilePath, Src.Module, A.Located Src.Value)))
 findDefinitionForLowVarInImports state details root imports name =
   let
     potentialSources =
@@ -733,9 +776,13 @@ findDefinitionForLowVarInImports state details root imports name =
     (\import_ acc ->
       do  x <- findDefinitionForNameInModule state details root (Src.getImportName import_) name
           y <- acc
-          return (x <|> y)
+
+          case (y, x) of
+            (Left _, x) -> return x
+            (Right Nothing, _) -> return x
+            (Right (Just _), _) -> return y
     )
-    (return Nothing)
+    (return (Right Nothing))
     potentialSources
 
 
@@ -745,7 +792,7 @@ findDefinitionForInfixInImports ::
   -> FilePath
   -> [Src.Import]
   -> Name
-  -> Task.Task DefinitionExit (Maybe (FilePath, Src.Module, A.Located Src.Infix))
+  -> IO (Either DefinitionExit (Maybe (FilePath, Src.Module, A.Located Src.Infix)))
 findDefinitionForInfixInImports state details root imports name =
   let
     potentialSources =
@@ -767,9 +814,12 @@ findDefinitionForInfixInImports state details root imports name =
     (\import_ acc ->
       do  x <- findDefinitionForInfixInModule state details root (Src.getImportName import_) name
           y <- acc
-          return (x <|> y)
+
+          case (y, x) of
+            (Left _, x) -> return x
+            (Right acc, _) -> return $ Right acc
     )
-    (return Nothing)
+    (return (Right Nothing))
     potentialSources
 
 
@@ -779,19 +829,25 @@ findDefinitionForInfixInModule ::
   -> FilePath
   -> ModuleName.Raw
   -> Name
-  -> Task.Task DefinitionExit (Maybe (FilePath, Src.Module, A.Located Src.Infix))
+  -> IO (Either DefinitionExit (Maybe (FilePath, Src.Module, A.Located Src.Infix)))
 findDefinitionForInfixInModule state details root moduleName name =
-  do  (path, src) <- loadSrcModule state details root moduleName
+  do  pathAndSrc <- loadSrcModule state details root moduleName
 
-      let def =
-            foldr
-              (\infix_@(A.At _ (Src.Infix name_ _ _ _)) acc ->
-                if name_ == name then Just infix_ else acc
-              )
-              Nothing
-              (Src._binops src)
+      case pathAndSrc of
+        Right (path, src) ->
+          let def =
+                foldr
+                  (\infix_@(A.At _ (Src.Infix name_ _ _ _)) acc ->
+                    if name_ == name then Just infix_ else acc
+                  )
+                  Nothing
+                  (Src._binops src)
 
-      return (fmap (\a -> (path, src, a)) def)
+          in
+          return $ Right (fmap (\a -> (path, src, a)) def)
+
+        Left exit ->
+          return $ Left exit
 
 
 findDefinitionForNameInModule ::
@@ -800,11 +856,16 @@ findDefinitionForNameInModule ::
   -> FilePath
   -> ModuleName.Raw
   -> Name
-  -> Task.Task DefinitionExit (Maybe (FilePath, Src.Module, A.Located Src.Value))
+  -> IO (Either DefinitionExit (Maybe (FilePath, Src.Module, A.Located Src.Value)))
 findDefinitionForNameInModule state details root moduleName name =
-  do  (path, src) <- loadSrcModule state details root moduleName
+  do  pathAndSrc <- loadSrcModule state details root moduleName
 
-      return (fmap (\a -> (path, src, a)) $ findLowVarDefinitionNamed name src)
+      case pathAndSrc of
+        Right (path, src) ->
+          return $ Right $ fmap (\a -> (path, src, a)) $ findLowVarDefinitionNamed name src
+
+        Left exit ->
+          return $ Left exit
 
 
 lookupPkgPath :: Details.Details -> ModuleName.Raw -> IO (Maybe FilePath)
@@ -873,6 +934,8 @@ findDefinitionForNameInPattern name pattern@(A.At _ pattern_) =
     Src.PInt _ -> Nothing
 
 
+-- FIXME: call it a symbol or sth? References also seem like a good
+-- idea - like a reference to something in some context
 data DefinedEntity
   = DEVar [A.Located Src.Def] [Src.Pattern] Src.VarType Name
   | DEVarQual [A.Located Src.Def] [Src.Pattern] Src.VarType Name Name
@@ -1121,10 +1184,10 @@ findReferences state filePath position =
 
               localSrc <-
                 case Details._outline details of
-                  Details.ValidApp _ -> loadSrcModuleByPath state filePath
-                  Details.ValidPkg name _ _ -> loadPkgModuleByPath state name filePath
+                  Details.ValidApp _ -> Task.eio id $ loadSrcModuleByPath state filePath
+                  Details.ValidPkg name _ _ -> Task.eio id $ loadPkgModuleByPath state name filePath
 
-              definition <- findDefinition_ state details root filePath localSrc position
+              definition <- Task.eio id $ findDefinition_ state details root filePath localSrc position
 
               case definition of
                 (modulePath, defSrc, A.At defRegion (FoundValue value@(Src.Value name _ _ _))) ->
@@ -1134,8 +1197,7 @@ findReferences state filePath position =
 
                       foldr
                         (\a acc ->
-                          do  (importerPath, importerSrc) <- loadSrcModule state details root a
-
+                          do  (importerPath, importerSrc) <- Task.eio id $ loadSrcModule state details root a
                               foundRefs <- acc
 
                               let newRefs =
@@ -1159,7 +1221,7 @@ findReferences state filePath position =
 
                       foldr
                         (\a acc ->
-                          do  (importerPath, importerSrc) <- loadSrcModule state details root a
+                          do  (importerPath, importerSrc) <- Task.eio id $ loadSrcModule state details root a
 
                               foundRefs <- acc
 
@@ -1181,64 +1243,65 @@ findReferences state filePath position =
                   return []
 
 
-loadSrcModule :: State -> Details.Details -> FilePath -> ModuleName.Raw -> Task.Task DefinitionExit (FilePath, Src.Module)
+loadSrcModule :: State -> Details.Details -> FilePath -> ModuleName.Raw -> IO (Either DefinitionExit (FilePath, Src.Module))
 loadSrcModule state details root moduleName =
-  do  files <- Task.io $ Control.Concurrent.MVar.readMVar (_changedFiles state)
+  do  files <- Control.Concurrent.MVar.readMVar (_changedFiles state)
 
-      (projectType, filePath) <-
-        Task.mio (DefinitionExitModuleNotFound root moduleName) $
-          case Details._outline details of
-            Details.ValidApp _ ->
-              do  let local = lookupModulePath details moduleName
-                  let pkgName = lookupPkgName details moduleName
+      projectTypeAndFilePath <-
+        case Details._outline details of
+          Details.ValidApp _ ->
+            do  let local = lookupModulePath details moduleName
+                let pkgName = lookupPkgName details moduleName
 
-                  pkg <- lookupPkgPath details moduleName
+                pkg <- lookupPkgPath details moduleName
 
-                  return
-                    ((fmap (\a -> (Parse.Application, a)) local)
-                      <|> ((,) <$> fmap Parse.Package pkgName <*> pkg)
-                    )
+                return
+                  ((fmap (\a -> (Parse.Application, a)) local)
+                    <|> ((,) <$> fmap Parse.Package pkgName <*> pkg)
+                  )
 
-            Details.ValidPkg pkgName _ _ ->
-              do  let local = lookupModulePath details moduleName
-                  let pkgName_ = lookupPkgName details moduleName
-                  pkg <- lookupPkgPath details moduleName
+          Details.ValidPkg pkgName _ _ ->
+            do  let local = lookupModulePath details moduleName
+                let pkgName_ = lookupPkgName details moduleName
+                pkg <- lookupPkgPath details moduleName
 
-                  return
-                    ((fmap (\a -> (Parse.Package pkgName, a)) local)
-                      <|> ((,) <$> fmap Parse.Package pkgName_ <*> pkg)
-                    )
+                return
+                  ((fmap (\a -> (Parse.Package pkgName, a)) local)
+                    <|> ((,) <$> fmap Parse.Package pkgName_ <*> pkg)
+                  )
 
-      source <-
-        maybe (Task.io $ File.readUtf8 filePath) return $
-          Map.lookup filePath files
+      case projectTypeAndFilePath of
+        Just (projectType, filePath) ->
+          do  source <-
+                maybe (File.readUtf8 filePath) return $
+                  Map.lookup filePath files
 
-      Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
-        return (fmap ((,) filePath) (Parse.fromByteString projectType source))
+              return $
+                Data.Bifunctor.first (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
+                  (fmap ((,) filePath) (Parse.fromByteString projectType source))
+
+        Nothing ->
+          return $ Left $ DefinitionExitModuleNotFound root moduleName
 
 
-loadSrcModuleByPath :: State -> FilePath -> Task.Task DefinitionExit Src.Module
+loadSrcModuleByPath :: State -> FilePath -> IO (Either DefinitionExit Src.Module)
 loadSrcModuleByPath state filePath =
-  do  files <- Task.io $ Control.Concurrent.MVar.readMVar (_changedFiles state)
+  do  files <- Control.Concurrent.MVar.readMVar (_changedFiles state)
+      source <- maybe (File.readUtf8 filePath) return $ Map.lookup filePath files
 
-      source <-
-        maybe (Task.io $ File.readUtf8 filePath) return $
-          Map.lookup filePath files
-
-      Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
-        return (Parse.fromByteString Parse.Application source)
+      return $
+        Data.Bifunctor.first (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
+          (Parse.fromByteString Parse.Application source)
 
 
-loadPkgModuleByPath :: State -> Pkg.Name -> FilePath -> Task.Task DefinitionExit Src.Module
+loadPkgModuleByPath :: State -> Pkg.Name -> FilePath -> IO (Either DefinitionExit Src.Module)
 loadPkgModuleByPath state pkgName filePath =
-  do  files <- Task.io $ Control.Concurrent.MVar.readMVar (_changedFiles state)
+  do  files <- Control.Concurrent.MVar.readMVar (_changedFiles state)
+      source <- maybe (File.readUtf8 filePath) return $ (Map.lookup filePath files)
 
-      source <-
-        maybe (Task.io $ File.readUtf8 filePath) return $
-          (Map.lookup filePath files)
-
-      Task.eio (DefinitionExitBadInput source . Reporting.Error.BadSyntax) $
-        return (Parse.fromByteString (Parse.Package pkgName) source)
+      return $
+        Data.Bifunctor.first (DefinitionExitBadInput source . Reporting.Error.BadSyntax)
+          (Parse.fromByteString (Parse.Package pkgName) source)
 
 
 isLowVarExposed :: Src.Import -> Name -> Bool
