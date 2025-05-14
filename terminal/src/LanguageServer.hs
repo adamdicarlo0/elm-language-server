@@ -1,4 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeSynonymInstances #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 module LanguageServer
   ( run
@@ -25,6 +27,9 @@ import qualified Data.Map.Utils as Map
 import qualified Data.Map.Strict as Map
 import qualified Data.Utf8 as Utf8
 import qualified Data.Set as Set
+import qualified Data.NonEmptyList
+import qualified Data.OneOrMore as OneOrMore
+import qualified Data.Map
 
 import qualified System.IO as IO
 import qualified System.Directory as Dir
@@ -33,6 +38,8 @@ import qualified File
 import qualified System.FilePath as Path
 
 import qualified Stuff
+import qualified Build
+import qualified Compile
 
 import qualified Parse.Module as Parse
 
@@ -41,33 +48,61 @@ import qualified Reporting.Doc
 import qualified Reporting.Error
 import qualified Reporting.Error.Syntax
 import qualified Reporting.Exit
+import qualified Reporting.Warning
 import qualified Reporting.Exit.Help
 import qualified Reporting.Report
 import qualified Reporting.Render.Code as Code
 import qualified Reporting.Task as Task
 import qualified Reporting.Annotation as A
+import qualified Reporting.Result
+import qualified Reporting.Error.Type
+import qualified Reporting.Error.Docs
+import qualified Reporting.Render.Type.Localizer
 
 import qualified Elm.Details as Details
 import qualified Elm.Outline as Outline
 import qualified Elm.Version as Version
+import qualified Elm.Interface as Interface
+import qualified Elm.Docs as Docs
+import qualified Elm.Compiler.Type.Extract as Extract
+import qualified Elm.Compiler.Type as Type
+
 import qualified Elm.Package as Pkg
 import qualified Deps.Registry
+import qualified Nitpick.PatternMatches
+import qualified Optimize.Module
 
 import qualified AST.Source as Src
+import qualified AST.Canonical as Can
+import qualified Canonicalize.Module
+import qualified AST.Optimized as Opt
 import qualified Elm.ModuleName as ModuleName
 
 import qualified BackgroundWriter as BW
 
+import qualified Type.Constrain.Module as Type
+import qualified System.IO.Unsafe
+import qualified Type.Solve as Type
 
+import qualified Json.String
+import qualified Control.Monad
 
-newtype State = State
+import Data.Function ((&))
+
+import Data.Map ((!))
+
+data State = State
   { _changedFiles :: Control.Concurrent.MVar.MVar (Map.Map FilePath BS.ByteString)
+  , _prevPublishedDiagnosticsFiles :: Control.Concurrent.MVar.MVar [FilePath]
   }
 
 
 run :: IO ()
 run = do
-  state <- State <$> Control.Concurrent.MVar.newMVar Map.empty
+  state <-
+    State
+      <$> Control.Concurrent.MVar.newMVar Map.empty
+      <*> Control.Concurrent.MVar.newMVar []
 
   loop state
 
@@ -110,6 +145,9 @@ run = do
                                     , "textDocumentSync" .= Aeson.object
                                          [ "openClose" .= True
                                          , "change" .= (2 :: Int)
+                                         -- FIXME: use includeText
+                                         -- https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_didSave
+                                         , "save" .= True
                                          ]
                                     , "referencesProvider" .= Aeson.object
                                        [ "workDoneProgress" .= True
@@ -143,7 +181,7 @@ run = do
                               let filePath :: FilePath
                                   filePath = drop 7 uri
 
-                              text <- textDocument .: "text" >>= (pure . BS.pack)
+                              text <- textDocument .: "text" >>= (pure . BSLC.toStrict . BSLC.pack)
 
                               return (version, filePath, text)
                         ) =<< Aeson.eitherDecode body
@@ -159,7 +197,79 @@ run = do
                           Control.Concurrent.MVar.modifyMVar_ mVar $ \a ->
                             return $ Map.insert filePath text a
 
+                          result <- diagnostics filePath []
+
+                          case result of
+                            Left err ->
+                              do  IO.hPutStr IO.stderr $ Reporting.Exit.toString $
+                                    diagnosticsExitToReport err
+
+                                  loop state
+
+                            Right stuffs ->
+                              do  prev <- Control.Concurrent.MVar.readMVar (_prevPublishedDiagnosticsFiles state)
+                                  let diff = List.filter (\a -> List.all (\(n, _, _) -> n /= a) stuffs) prev
+                                  mapM_ (\a -> publishReportDiagnostic a 1 []) diff
+                                  Control.Concurrent.MVar.modifyMVar_ (_prevPublishedDiagnosticsFiles state)
+                                    (\a -> pure (map (\(a,_,_) -> a) stuffs))
+                                  mapM_
+                                    (\(filePath, i, reports) ->
+                                      publishReportDiagnostic filePath i reports
+                                    )
+                                    stuffs
+
+                                  loop state
+
+            Right "textDocument/didSave" ->
+              do  let result =
+                        Aeson.parseEither (\obj ->
+                          do  params <- obj .: "params"
+                              textDocument <- params .: "textDocument"
+                              uri <- textDocument .: "uri" :: Aeson.Parser String
+
+                              let filePath :: FilePath
+                                  filePath = drop 7 uri
+
+                              return filePath
+                        ) =<< Aeson.eitherDecode body
+
+                  case result of
+                    Left err ->
+                      do  IO.hPutStr IO.stderr ("Error decoding JSON: " ++ err)
                           loop state
+
+                    Right filePath ->
+                      do  let mVar = _changedFiles state
+
+                          Control.Concurrent.MVar.modifyMVar_ mVar $ \a ->
+                            return $ Map.delete filePath a
+
+                          result <- diagnostics filePath []
+
+                          case result of
+                            Left err ->
+                              do  IO.hPutStr IO.stderr $ Reporting.Exit.toString $
+                                    diagnosticsExitToReport err
+
+                                  loop state
+
+                            Right stuffs ->
+                              do  prev <- Control.Concurrent.MVar.readMVar (_prevPublishedDiagnosticsFiles state)
+
+                                  let diff = List.filter (\a -> List.all (\(n, _, _) -> n /= a) stuffs) prev
+
+                                  mapM_ (\a -> publishReportDiagnostic a 1 []) diff
+
+                                  Control.Concurrent.MVar.modifyMVar_ (_prevPublishedDiagnosticsFiles state)
+                                    (\a -> pure (map (\(a,_,_) -> a) stuffs))
+
+                                  mapM_
+                                    (\(filePath, i, reports) ->
+                                      publishReportDiagnostic filePath i reports
+                                    )
+                                    stuffs
+
+                                  loop state
 
             Right "textDocument/didClose" ->
               do  let result =
@@ -342,7 +452,7 @@ parseTextDocumentContentChangeEvent :: Aeson.Value -> Aeson.Parser ((A.Position,
 parseTextDocumentContentChangeEvent =
   Aeson.withObject "TextDocumentContentChangeEvent" $ \obj ->
     do  range <- parseRange =<< obj .: "range"
-        text <- obj .: "text" >>= (pure . BS.pack)
+        text <- obj .: "text" >>= (pure . BSLC.toStrict . BSLC.pack)
 
         return (range, text)
 
@@ -512,6 +622,31 @@ messageTypeToValue messageType =
     MessageTypeDebug -> 5
 
 
+publishReportDiagnostic :: FilePath -> Int -> [Reporting.Report.Report] -> IO ()
+publishReportDiagnostic filePath severity reports =
+  sendNotification "textDocument/publishDiagnostics"
+    (Aeson.object
+      [ "uri" Aeson..= ("file://" ++ filePath :: String)
+      , "diagnostics" Aeson..= map
+        (\(Reporting.Report.Report title (A.Region (A.Position sr sc) (A.Position er ec)) _sgstns message) ->
+          Aeson.object
+            [ "range" Aeson..= Aeson.object
+              [ "start" Aeson..= Aeson.object
+                [ "line" Aeson..= (sr - 1)
+                , "character" Aeson..= (sc - 1)
+                ]
+              , "end" Aeson..= Aeson.object
+                [ "line" Aeson..= (er - 1)
+                , "character" Aeson..= (ec - 1)
+                ]
+              ]
+            , "severity" Aeson..= (severity :: Int)
+            , "message" Aeson..= (title ++ "\n\n" ++ Reporting.Doc.toString message :: String)
+            ]
+        )
+        reports
+      ]
+    )
 
 -- DEFINITION
 
@@ -1632,3 +1767,1202 @@ getPackageNewestVersionFromRegistry packageName =
           case Map.lookup packageName (Deps.Registry._versions registry) of
             Nothing -> pure Nothing
             Just knownVersions -> pure (Just (Deps.Registry._newest knownVersions))
+
+
+
+-- DIAGNOSTICS
+
+
+data DiagnosticsExit
+  = DiagnosticsExitNoRoot
+  | DiagnosticsExitBadDetails Reporting.Exit.Details
+  | DiagnosticsExitBadBuild Reporting.Exit.BuildProblem
+
+
+diagnosticsExitToReport :: DiagnosticsExit -> Reporting.Exit.Help.Report
+diagnosticsExitToReport exit =
+  case exit of
+    DiagnosticsExitNoRoot ->
+      Reporting.Exit.Help.report "DIAGNOSTICS FOR WHAT?" Nothing
+        "I cannot find an elm.json so I am not sure what you want diagnostics for."
+        [ Reporting.Doc.reflow $
+            "Elm packages always have an elm.json that says current the version number. If\
+            \ you run this command from a directory with an elm.json file, I will try to bump\
+            \ the version in there based on the API changes."
+        ]
+    DiagnosticsExitBadDetails details ->
+      Reporting.Exit.toDetailsReport details
+
+    DiagnosticsExitBadBuild problem ->
+      Reporting.Exit.toBuildProblemReport problem
+
+
+diagnostics :: FilePath -> [FilePath] -> IO (Either DiagnosticsExit [(FilePath, Int, [Reporting.Report.Report])])
+diagnostics filePath remain =
+  do  maybeRoot <- Dir.withCurrentDirectory (Path.takeDirectory filePath) Stuff.findRoot
+
+      case maybeRoot of
+        Nothing ->
+          return $ Left DiagnosticsExitNoRoot
+
+        Just root ->
+          do  result <- build root (Data.NonEmptyList.List filePath remain)
+
+              case result of
+                Right artifacts -> do
+                  fmap Right $ foldrM
+                    (\path acc -> do
+                      source <- File.readUtf8 path
+                      warnings <- warnings root path
+
+                      case warnings of
+                        Nothing ->
+                          return acc
+
+                        Just ( sourceMod, warns ) ->
+                          let
+                            warningToReport :: Reporting.Warning.Warning -> Reporting.Report.Report
+                            warningToReport =
+                              Reporting.Warning.toReport
+                                (Reporting.Render.Type.Localizer.fromModule sourceMod)
+                                (Code.toSource source)
+                          in
+                          return $ ( filePath, 2, map warningToReport warns ) : acc
+                    )
+                    []
+                    (filePath : remain)
+
+                Left exit-> do
+                  case exit of
+                    DiagnosticsExitBadBuild buildProblem ->
+                      case Reporting.Exit.toBuildProblemReport buildProblem of
+                        Reporting.Exit.Help.CompilerReport filePath e es ->
+                          return $ Right $ map
+                            (\(Reporting.Error.Module name path _ source err) ->
+                              (
+                                path,
+                                1,
+                                Data.NonEmptyList.toList $
+                                  Reporting.Error.toReports (Code.toSource source) err
+                              )
+                            )
+                            (e : es)
+
+                        _ ->
+                          return $ Left exit
+
+
+                    _ ->
+                      return $ Left exit
+
+
+build :: FilePath -> Data.NonEmptyList.List FilePath -> IO (Either DiagnosticsExit Build.Artifacts)
+build root paths =
+  do  Dir.withCurrentDirectory root $
+        BW.withScope $ \scope -> Stuff.withRootLock root $
+          Task.run $
+            do  details <- Task.eio DiagnosticsExitBadDetails $ Details.load Reporting.silent scope root
+
+                Task.eio DiagnosticsExitBadBuild $ Build.fromPaths Reporting.silent root details paths
+
+
+
+-- LOAD SINGLE
+
+
+data SingleFileResult = Single
+  { _source :: Either Reporting.Error.Syntax.Error Src.Module,
+    _warnings :: Maybe [Reporting.Warning.Warning],
+    _interfaces :: Maybe (Map.Map ModuleName.Raw Interface.Interface),
+    _canonical :: Maybe Can.Module,
+    _compiled :: Maybe (Either Reporting.Error.Error Compile.Artifacts)
+  }
+
+
+
+data Artifacts =
+  Artifacts
+    { _ifaces :: Map.Map ModuleName.Raw Interface.Interface
+    , _graph :: Opt.GlobalGraph
+    }
+
+
+
+
+-- WARNINGS
+
+
+warnings :: FilePath -> FilePath -> IO (Maybe (Src.Module, [ Reporting.Warning.Warning ]))
+warnings root path = do
+    loaded <- loadSingle root path
+
+    let (Single source maybeWarnings interfaces canonical compiled) =
+           addAliasOptionsToWarnings $
+             addUnusedDeclarations $
+             addUnusedImports loaded
+
+    let warnings =
+          case source of
+            Right sourceMod -> Just (sourceMod, Maybe.fromMaybe [] maybeWarnings)
+            Left _ -> Nothing
+
+    pure warnings
+
+
+{-
+The below function also modifies the canonical AST by hydrating missing types.
+
+-}
+-- @TODO this is a disk mode function
+loadSingle :: FilePath -> FilePath -> IO SingleFileResult
+loadSingle root path =
+  Dir.withCurrentDirectory root $
+    do  source <- File.readUtf8 path
+        case Parse.fromByteString Parse.Application source of
+          Right srcModule ->
+            do  ifacesResult <- allInterfaces root (Data.NonEmptyList.List path [])
+                (Artifacts packageIfaces globalGraph) <- allPackageArtifacts root
+                pure $ case ifacesResult of
+                  Left exit ->
+                    -- report exit : Exit.Reactor?
+                      Single
+                        (Right srcModule)
+                        Nothing
+                        Nothing
+                        Nothing
+                        Nothing
+
+                  Right localIfaces ->
+                    let ifaces = Map.union localIfaces packageIfaces
+                        (canWarnings, eitherCanned) =
+                          Reporting.Result.run $
+                            Canonicalize.Module.canonicalize Pkg.dummyName ifaces srcModule
+                    in
+                    case eitherCanned of
+                      Left errs ->
+                          Single
+                            (Right srcModule)
+                            (Just canWarnings)
+                            (Just ifaces)
+                            Nothing
+                            (Just (Left (Reporting.Error.BadNames errs)))
+
+                      Right initialCanModule ->
+                        let canModule = addMissingTypes canWarnings initialCanModule
+                        in
+                        case typeCheck srcModule canModule of
+                          Left typeErrors ->
+                            Single
+                              (Right srcModule)
+                              (Just canWarnings)
+                              (Just ifaces)
+                              (Just canModule)
+                              ( Just
+                                  ( Left
+                                      ( Reporting.Error.BadTypes
+                                          (Reporting.Render.Type.Localizer.fromModule srcModule)
+                                          typeErrors
+                                      )
+                                  )
+                              )
+
+                          Right annotations ->
+                            let nitpicks = Nitpick.PatternMatches.check canModule
+
+                                (optWarnings, eitherLocalGraph) =
+                                  Reporting.Result.run $
+                                    Optimize.Module.optimize annotations canModule
+                            in
+                            case eitherLocalGraph of
+                              Left errs ->
+                                Single
+                                  (Right srcModule)
+                                  (Just (canWarnings <> optWarnings))
+                                  (Just ifaces)
+                                  (Just canModule)
+                                  ( Just
+                                      ( Left
+                                          ( Reporting.Error.BadMains
+                                              (Reporting.Render.Type.Localizer.fromModule srcModule)
+                                              errs
+                                          )
+                                      )
+                                  )
+
+                              Right localGraph ->
+                                Single
+                                  (Right srcModule)
+                                  (Just (canWarnings <> optWarnings))
+                                  (Just ifaces)
+                                  (Just canModule)
+                                  ( Just
+                                      ( case nitpicks of
+                                          Right () ->
+                                            Right (Compile.Artifacts canModule annotations localGraph)
+
+                                          Left errors ->
+                                            Left (Reporting.Error.BadPatterns errors)
+                                      )
+                                  )
+
+          Left err ->
+            pure
+              ( Single
+                  (Left err)
+                  Nothing
+                  Nothing
+                  Nothing
+                  Nothing
+              )
+
+
+allInterfaces :: FilePath -> Data.NonEmptyList.List FilePath -> IO (Either Reporting.Exit.Reactor (Map.Map ModuleName.Raw Interface.Interface))
+allInterfaces root paths =
+  Dir.withCurrentDirectory root $
+    BW.withScope $ \scope -> Stuff.withRootLock root $
+      Task.run $
+        do  details <- Task.eio Reporting.Exit.ReactorBadDetails $
+              Details.load Reporting.silent scope root
+            artifacts <- Task.eio Reporting.Exit.ReactorBadBuild $
+              Build.fromPaths Reporting.silent root details paths
+
+            Task.io $ extractInterfaces root $ Build._modules artifacts
+
+
+extractInterfaces :: FilePath -> [Build.Module] -> IO (Map.Map ModuleName.Raw Interface.Interface)
+extractInterfaces root modu =
+  do  k <-
+        mapM
+          ( \m ->
+              case m of
+                Build.Fresh nameRaw ifaces _ ->
+                  pure $ Just (nameRaw, ifaces)
+                Build.Cached name _ mCachedInterface ->
+                  cachedHelp root name mCachedInterface
+          )
+          modu
+
+      pure $ Map.fromList $ Maybe.catMaybes k
+
+
+{- Appropriated from Build.loadInterface -}
+cachedHelp :: FilePath -> ModuleName.Raw -> Control.Concurrent.MVar.MVar Build.CachedInterface -> IO (Maybe (ModuleName.Raw, Interface.Interface))
+cachedHelp root name ciMvar = do
+  cachedInterface <- Control.Concurrent.MVar.takeMVar ciMvar
+  case cachedInterface of
+    Build.Corrupted ->
+      do  Control.Concurrent.MVar.putMVar ciMvar cachedInterface
+          return Nothing
+
+    Build.Loaded iface ->
+      do  Control.Concurrent.MVar.putMVar ciMvar cachedInterface
+          return (Just (name, iface))
+
+    Build.Unneeded ->
+      do  maybeIface <- File.readBinary (Stuff.elmi root name)
+          case maybeIface of
+            Nothing ->
+              do  Control.Concurrent.MVar.putMVar ciMvar Build.Corrupted
+                  return Nothing
+
+            Just iface ->
+              do  Control.Concurrent.MVar.putMVar ciMvar (Build.Loaded iface)
+                  return (Just (name, iface))
+
+
+{- Appropriated from worker/src/Artifacts.hs
+   WARNING: does not load any user code!!!
+-}
+allPackageArtifacts :: FilePath ->  IO Artifacts
+allPackageArtifacts root =
+  BW.withScope $ \scope ->
+  do  --debug "Loading allDeps"
+      let style = Reporting.silent
+      result <- Details.load style scope root
+      case result of
+        Left _ ->
+          error $ "Ran into some problem loading elm.json\nTry running `elm make` in: " ++ root
+
+        Right details ->
+          do  omvar <- Details.loadObjects root details
+              imvar <- Details.loadInterfaces root details
+              mdeps <- Control.Concurrent.MVar.readMVar imvar
+              mobjs <- Control.Concurrent.MVar.readMVar omvar
+              case Control.Monad.liftM2 (,) mdeps mobjs of
+                Nothing ->
+                  error $ "Ran into some weird problem loading elm.json\nTry running `elm make` in: " ++ root
+
+                Just (deps, objs) ->
+                  return $ Artifacts (toInterfaces deps) objs
+
+
+toInterfaces :: Map.Map ModuleName.Canonical Interface.DependencyInterface -> Map.Map ModuleName.Raw Interface.Interface
+toInterfaces deps =
+  Map.mapMaybe toUnique $ Map.fromListWith OneOrMore.more $
+    Map.elems (Map.mapMaybeWithKey getPublic deps)
+
+
+toUnique :: OneOrMore.OneOrMore a -> Maybe a
+toUnique oneOrMore =
+  case oneOrMore of
+    OneOrMore.One value -> Just value
+    OneOrMore.More _ _  -> Nothing
+
+
+getPublic :: ModuleName.Canonical -> Interface.DependencyInterface -> Maybe (ModuleName.Raw, OneOrMore.OneOrMore Interface.Interface)
+getPublic (ModuleName.Canonical _ name) dep =
+  case dep of
+    Interface.Public  iface -> Just (name, OneOrMore.one iface)
+    Interface.Private _ _ _ -> Nothing
+
+
+addMissingTypes :: [Reporting.Warning.Warning] -> Can.Module -> Can.Module
+addMissingTypes warnings canModul =
+  let lookup :: Map.Map Name.Name Can.Type
+      lookup =
+        Map.fromList $
+          Maybe.catMaybes $
+            fmap
+              (\warning ->
+                case warning of
+                  Reporting.Warning.MissingTypeAnnotation region name annotation ->
+                    Just (name, annotation)
+
+                  _ ->
+                    Nothing
+              )
+              warnings
+   in
+   canModul {Can._decls = addMissingTypeToDecl lookup (Can._decls canModul)}
+
+
+addMissingTypeToDecl :: Map.Map Name.Name Can.Type -> Can.Decls -> Can.Decls
+addMissingTypeToDecl lookup decl =
+  case decl of
+    Can.Declare def moarDecls ->
+      Can.Declare
+        (addMissingTypeToDef lookup def)
+        (addMissingTypeToDecl lookup moarDecls)
+
+    Can.DeclareRec def defs moarDecls ->
+      Can.DeclareRec
+        (addMissingTypeToDef lookup def)
+        (fmap (addMissingTypeToDef lookup) defs)
+        (addMissingTypeToDecl lookup moarDecls)
+
+    Can.SaveTheEnvironment ->
+      Can.SaveTheEnvironment
+
+
+addMissingTypeToDef :: Map.Map Name.Name Can.Type -> Can.Def -> Can.Def
+addMissingTypeToDef typeLookup def =
+  case def of
+    Can.Def locatedName patterns expr ->
+      let maybeType = Map.lookup (A.toValue locatedName) typeLookup
+      in
+      case maybeType of
+        Nothing ->
+          def
+
+        Just tipe ->
+          Can.TypedDef locatedName Map.empty (fmap (\patt -> (patt, Can.TUnit)) patterns) expr tipe
+
+    _ ->
+      def
+
+
+typeCheck ::
+  Src.Module
+    -> Can.Module
+    -> Either
+        (Data.NonEmptyList.List Reporting.Error.Type.Error)
+        (Map.Map Name.Name Can.Annotation)
+typeCheck modul canonical =
+  System.IO.Unsafe.unsafePerformIO (Type.run =<< Type.constrain canonical)
+
+
+addAliasOptionsToWarnings :: SingleFileResult -> SingleFileResult
+addAliasOptionsToWarnings untouched@(Single source maybeWarnings maybeInterfaces canonical compiled) =
+    case (canonical, maybeInterfaces, maybeWarnings) of
+        (Just canModule, Just interfaces, Just warnings) ->
+            let newWarnings = fmap (addAliasesHelper canModule interfaces) warnings
+            in
+            Single source (Just newWarnings) maybeInterfaces canonical compiled
+
+        _ ->
+            untouched
+
+
+addAliasesHelper :: Can.Module -> Data.Map.Map ModuleName.Raw Interface.Interface -> Reporting.Warning.Warning -> Reporting.Warning.Warning
+addAliasesHelper canModule interfaces warning =
+    case warning of
+        Reporting.Warning.UnusedImport _ _ ->
+            warning
+
+        Reporting.Warning.UnusedVariable _ _ _ ->
+            warning
+
+        Reporting.Warning.MissingTypeAnnotation region name canType ->
+            Reporting.Warning.MissingTypeAnnotation region name (addAliasesToType canModule interfaces canType)
+
+
+addAliasesToType :: Can.Module -> Data.Map.Map ModuleName.Raw Interface.Interface -> Can.Type -> Can.Type
+addAliasesToType canModule interfaces canType =
+  case canType of
+    Can.TLambda one two ->
+      Can.TLambda
+        (addAliasesToType canModule interfaces one)
+        (addAliasesToType canModule interfaces two)
+
+    Can.TVar _ ->
+      canType
+
+    Can.TType moduleName name children ->
+      Can.TType moduleName name
+        (fmap (addAliasesToType canModule interfaces) children)
+
+    Can.TRecord fieldMap maybeName ->
+      case getAliasForRecord fieldMap canModule interfaces of
+        Nothing -> canType
+        Just aliasFound -> aliasFound
+
+    Can.TUnit ->
+      canType
+
+    Can.TTuple one two Nothing ->
+      Can.TTuple
+        (addAliasesToType canModule interfaces one)
+        (addAliasesToType canModule interfaces two)
+        Nothing
+
+    Can.TTuple one two (Just three) ->
+      Can.TTuple
+        (addAliasesToType canModule interfaces one)
+        (addAliasesToType canModule interfaces two)
+        (Just ((addAliasesToType canModule interfaces three)))
+
+    Can.TAlias moduleName name vars (Can.Holey holeyType) ->
+      canType
+
+    Can.TAlias moduleName name vars (Can.Filled holeyType) ->
+      canType
+
+
+getAliasForRecord :: Data.Map.Map Name Can.FieldType -> Can.Module -> Data.Map.Map ModuleName.Raw Interface.Interface -> Maybe Can.Type
+getAliasForRecord fields canModule interfaces =
+    let (Can.Module _name _exports _docs _decls _unions aliases _binops _effects) = canModule
+        matches = Data.Map.foldrWithKey (getMatchingAliases canModule fields) [] aliases
+    in
+    case matches of
+      [] -> Nothing
+      (top : _) -> Just top
+
+
+getMatchingAliases :: Can.Module -> Data.Map.Map Name Can.FieldType -> Name -> Can.Alias -> [Can.Type] -> [Can.Type]
+getMatchingAliases canModule fields aliasName (Can.Alias vars aliasType) gathered =
+  case aliasType of
+    Can.TRecord aliasFieldMap maybeName ->
+      -- We only care about matching aliases for records
+      -- Everything else can contribte to obfuscation
+      case fulfillAliasVars fields vars aliasFieldMap of
+        Nothing ->
+          gathered
+
+        Just unifiedVars ->
+          let (Can.Module moduleName _ _ _ _ _ _ _) = canModule
+          in
+          Can.TAlias moduleName aliasName unifiedVars (Can.Filled aliasType) : gathered
+
+    Can.TLambda one two ->
+     gathered
+
+    Can.TVar _ ->
+     gathered
+
+    Can.TType moduleName name children ->
+     gathered
+
+    Can.TUnit ->
+     gathered
+
+    Can.TTuple one two Nothing ->
+     gathered
+
+    Can.TTuple one two (Just three) ->
+     gathered
+
+    Can.TAlias moduleName name myAliasVars (Can.Holey holeyType) ->
+     gathered
+
+    Can.TAlias moduleName name myAliasVars (Can.Filled holeyType) ->
+     gathered
+
+
+{-|
+  Make sure oneFields is a subrecord of twoFields.
+
+  And fill in what the vars should be for the alias.
+
+-}
+fulfillAliasVars :: Data.Map.Map Name Can.FieldType -> [Name] -> Data.Map.Map Name Can.FieldType -> Maybe [(Name, Can.Type)]
+fulfillAliasVars oneFields aliasVars twoFields =
+    let aliasVarMap = Data.Map.fromList $ fmap (\name -> (name, Can.TVar name)) aliasVars
+
+        unificationResult =
+          Data.Map.foldrWithKey
+            (\key value maybeVars ->
+              case maybeVars of
+                Nothing ->
+                  -- something failed somewhere
+                    Nothing
+                Just vars ->
+                  case Data.Map.lookup key twoFields of
+                    Nothing ->
+                      Nothing
+
+                    Just twoValue ->
+                      case unifyFieldType value twoValue of
+                        Nothing ->
+                          Nothing
+
+                        Just unifiedVars ->
+                          Just (vars ++ unifiedVars)
+            )
+            (Just [])
+            oneFields
+    in
+    case unificationResult of
+      Nothing ->
+        Nothing
+
+      Just varsResolved ->
+        Just varsResolved
+
+
+unifyFieldType :: Can.FieldType -> Can.FieldType -> Maybe [(Name, Can.Type)]
+unifyFieldType (Can.FieldType _ one) (Can.FieldType _ two) =
+  unifyType one two
+
+
+unifyType :: Can.Type -> Can.Type -> Maybe [(Name, Can.Type)]
+unifyType one two =
+  case (one, two) of
+    (firstType, Can.TVar twoVarName) ->
+      Just [(twoVarName, firstType)]
+
+    (Can.TRecord oneFields maybeName, Can.TRecord twoFields twoMaybeName) ->
+      let (newVars, finalRemainingFields) =
+            Data.Map.foldrWithKey
+              (\key value (maybeVars, remainingTwoFields) ->
+                case maybeVars of
+                  Nothing ->
+                    -- something failed somewhere
+                    ( Nothing
+                    , remainingTwoFields
+                    )
+
+                  Just vars ->
+                    case Data.Map.lookup key remainingTwoFields of
+                      Nothing ->
+                        ( Nothing
+                        , remainingTwoFields
+                        )
+
+                      Just twoValue ->
+                        case unifyFieldType value twoValue of
+                          Nothing ->
+                            ( Nothing
+                            , Data.Map.delete key remainingTwoFields
+                            )
+
+                          Just unifiedVars ->
+                            ( Just (vars ++ unifiedVars)
+                            , Data.Map.delete key remainingTwoFields
+                            )
+              )
+              (Just [], twoFields)
+              oneFields
+      in
+      if Data.Map.size finalRemainingFields > 0 then
+        Nothing
+
+      else
+        newVars
+
+    (Can.TLambda oneOne oneTwo, Can.TLambda twoOne twoTwo) ->
+        (++)
+          <$> unifyType oneOne twoOne
+          <*> unifyType oneTwo twoTwo
+
+
+    (Can.TType oneModuleName oneName oneVars, Can.TType twoModuleName twoName twoVars) ->
+      if oneModuleName == twoModuleName && oneName == twoName then
+        -- Wrong
+        Just []
+
+      else
+        Nothing
+
+    (Can.TUnit, Can.TUnit) ->
+      Just []
+
+    (Can.TTuple oneOne oneTwo Nothing, Can.TTuple twoOne twoTwo Nothing) ->
+      (++)
+        <$> unifyType oneOne twoOne
+        <*> unifyType oneTwo twoTwo
+
+    (Can.TTuple oneOne oneTwo (Just oneThree), Can.TTuple twoOne twoTwo (Just twoThree)) ->
+      (\a b c ->
+        a ++ b ++ b
+      )
+        <$> unifyType oneOne twoOne
+        <*> unifyType oneTwo twoTwo
+        <*> unifyType oneThree twoThree
+
+    (Can.TAlias oneModuleName oneName oneVars _, Can.TAlias twoModuleName twoName twoVars _) ->
+      if oneModuleName == twoModuleName && oneName == twoName then
+        Just oneVars
+
+      else
+        Nothing
+
+    _ ->
+      Nothing
+
+
+addUnusedDeclarations :: SingleFileResult -> SingleFileResult
+addUnusedDeclarations untouched@(Single source warnings interfaces canonical compiled) =
+  case canonical of
+    Nothing -> untouched
+
+    Just canModule ->
+      let (Can.Module _ exports _ decls _ _ _ _) = canModule
+      in
+      case exports of
+        Can.ExportEverything _ ->
+          untouched
+
+        Can.Export exportMap -> do
+          let usedValues = usedValues_ canModule
+          let (Can.Module _ _ _ decls _ _ _ _) = canModule
+          let unusedDecls = filterOutUsedDecls (Can._name canModule) exportMap usedValues decls
+          let unusedDeclWarnings = fmap declsToWarning unusedDecls
+          Single source (addUnused unusedDeclWarnings warnings) interfaces canonical compiled
+
+
+usedValues_ :: Can.Module -> Set.Set (ModuleName.Canonical, Name)
+usedValues_ (Can.Module name exports docs decls unions aliases binops effects) =
+  usedValueInDecls decls Set.empty
+
+
+declsToWarning :: Can.Def -> Reporting.Warning.Warning
+declsToWarning unusedDef =
+  case unusedDef of
+    Can.Def locatedName pattern expr ->
+      Reporting.Warning.UnusedVariable (A.toRegion locatedName) Reporting.Warning.Def (A.toValue locatedName)
+
+    Can.TypedDef locatedName frevars pattern expr type_ ->
+      Reporting.Warning.UnusedVariable (A.toRegion locatedName) Reporting.Warning.Def (A.toValue locatedName)
+
+
+filterOutUsedDecls :: ModuleName.Canonical -> Data.Map.Map Name (A.Located Can.Export) ->  Set.Set (ModuleName.Canonical, Name) -> Can.Decls -> [Can.Def]
+filterOutUsedDecls modName exportMap used decls =
+  case decls of
+    Can.SaveTheEnvironment ->
+      []
+
+    Can.Declare def moarDecls ->
+      let name = getDefIdentifier def
+          identifier = (modName, name)
+      in
+      if Set.member identifier used || Data.Map.member name exportMap then
+        filterOutUsedDecls modName exportMap used moarDecls
+      else
+        [def] <> filterOutUsedDecls modName exportMap used moarDecls
+
+    Can.DeclareRec def defs moarDecls ->
+      let name = getDefIdentifier def
+          identifier = (modName, name)
+      in
+      if Set.member identifier used || Data.Map.member name exportMap then
+        filterOutUsedDecls modName exportMap used moarDecls
+      else
+        [def] <> filterOutUsedDecls modName exportMap used moarDecls
+
+
+getDefIdentifier :: Can.Def -> Name
+getDefIdentifier def =
+  case def of
+    Can.Def locatedName _ _ ->
+      (A.toValue locatedName)
+
+    Can.TypedDef locatedName _ _ _ _ ->
+      (A.toValue locatedName)
+
+
+usedValueInDecls :: Can.Decls -> Set.Set (ModuleName.Canonical, Name) -> Set.Set (ModuleName.Canonical, Name)
+usedValueInDecls decls found =
+  case decls of
+    Can.Declare def moarDecls ->
+      usedValueInDecls moarDecls $ (usedValueInDef def found)
+
+    Can.DeclareRec def defs moarDecls ->
+      usedValueInDecls moarDecls $ List.foldl (flip usedValueInDef) found (def : defs)
+
+    Can.SaveTheEnvironment ->
+      found
+
+
+usedValueInDef :: Can.Def -> Set.Set (ModuleName.Canonical, Name) -> Set.Set (ModuleName.Canonical, Name)
+usedValueInDef def found =
+  case def of
+    Can.Def _ patterns expr ->
+      usedValueInExpr expr found
+
+    Can.TypedDef _ _ patternTypes expr tipe ->
+      usedValueInExpr expr found
+
+
+usedValuesInBranch :: Can.CaseBranch -> Set.Set (ModuleName.Canonical, Name) -> Set.Set (ModuleName.Canonical, Name)
+usedValuesInBranch (Can.CaseBranch pattern expr) found =
+  usedValueInExpr expr found
+
+
+usedValueInExpr :: Can.Expr -> Set.Set (ModuleName.Canonical, Name) -> Set.Set (ModuleName.Canonical, Name)
+usedValueInExpr (A.At pos expr) found =
+  case expr of
+    Can.VarLocal _ ->
+     found
+
+    Can.VarTopLevel canMod name ->
+     Set.insert (canMod, name) found
+
+    Can.VarKernel _ _ ->
+     found
+
+    Can.VarForeign canMod name annotation ->
+     Set.insert (canMod, name) found
+
+    Can.VarCtor _ canMod name index annotation ->
+     Set.insert (canMod, name) found
+
+    Can.VarDebug canMod name annotation ->
+     Set.insert (canMod, name) found
+
+    Can.VarOperator _ canMod name annotation ->
+     Set.insert (canMod, name) found
+
+    Can.Chr _ ->
+     found
+
+    Can.Str _ ->
+     found
+
+    Can.Int _ ->
+     found
+
+    Can.Float _ ->
+     found
+
+    Can.List exprList ->
+     List.foldr usedValueInExpr found exprList
+
+    Can.Negate expr ->
+     usedValueInExpr expr found
+
+    Can.Binop _ canMod name annotation exprOne exprTwo ->
+     usedValueInExpr exprTwo $ usedValueInExpr exprOne $ Set.insert (canMod, name) found
+
+    Can.Lambda patternList expr ->
+     usedValueInExpr expr found
+
+    Can.Call expr exprList ->
+     usedValueInExpr expr $ List.foldr usedValueInExpr found exprList
+
+    Can.If listTuple expr ->
+      usedValueInExpr expr $
+        List.foldr
+          (\(oneExpr, twoExpr) f ->
+            usedValueInExpr twoExpr $ usedValueInExpr oneExpr f
+          )
+          found listTuple
+
+    Can.Let def expr ->
+      usedValueInExpr expr $ usedValueInDef def $ found
+
+    Can.LetRec defList expr ->
+      usedValueInExpr expr $ List.foldr usedValueInDef found defList
+
+    Can.LetDestruct pattern oneExpr twoExpr ->
+      usedValueInExpr twoExpr $ usedValueInExpr oneExpr $ found
+
+    Can.Case expr branches ->
+      List.foldr usedValuesInBranch (usedValueInExpr expr found) $
+        branches
+
+    Can.Accessor _ ->
+      found
+
+    Can.Access expr _ ->
+      usedValueInExpr expr found
+
+    Can.Update _ expr record ->
+      usedValueInExpr expr $
+        List.foldl
+          (\innerFound (Can.FieldUpdate _ expr) -> usedValueInExpr expr innerFound)
+          found
+          (Map.elems record)
+
+    Can.Record record ->
+      List.foldl (flip usedValueInExpr) found $ Map.elems record
+
+    Can.Unit ->
+      found
+
+    Can.Tuple one two Nothing ->
+      usedValueInExpr two $ usedValueInExpr one found
+
+    Can.Tuple one two (Just three) ->
+      usedValueInExpr three $ usedValueInExpr two $ usedValueInExpr one found
+
+    Can.Shader _ _ ->
+      found
+
+
+addUnusedImports :: SingleFileResult -> SingleFileResult
+addUnusedImports untouched@(Single source warnings interfaces canonical compiled) =
+  case source of
+    Left _ ->
+      untouched
+
+    Right srcModule ->
+      case fmap usedModules canonical of
+        Nothing ->
+          untouched
+
+        Just usedModules ->
+          let (Src.Module _ _ _ imports _ _ _ _ _) = srcModule
+              filteredImports = filterOutDefaultImports imports
+              importNames = Set.fromList $ fmap Src.getImportName filteredImports
+              usedModuleNames = Set.map canModuleName usedModules
+              unusedImports = Set.difference importNames usedModuleNames
+              unusedImportWarnings = importsToWarnings (Set.toList unusedImports) filteredImports
+          in
+          Single source (addUnused unusedImportWarnings warnings) interfaces canonical compiled
+
+
+-- By default every Elm module has these modules imported with these region pairings.
+-- If they add a manual import of, e.g. `import Maybe`, then we'll get the same name
+-- but with a non-zero based region
+filterOutDefaultImports :: [Src.Import] -> [Src.Import]
+filterOutDefaultImports imports =
+  filter
+    (\(Src.Import (A.At region name) _ _) ->
+      not $ any (\defaultImport -> defaultImport == (name,region)) defaultImports
+    )
+    imports
+
+
+defaultImports :: [(Name, A.Region)]
+defaultImports =
+  [ ("Platform.Sub", A.Region (A.Position 0 0) (A.Position 0 0))
+  , ("Platform.Cmd", A.Region (A.Position 0 0) (A.Position 0 0))
+  , ("Platform", A.Region (A.Position 0 0) (A.Position 0 0))
+  , ("Tuple", A.Region (A.Position 0 0) (A.Position 0 0))
+  , ("Char", A.Region (A.Position 0 0) (A.Position 0 0))
+  , ("String", A.Region (A.Position 0 0) (A.Position 0 0))
+  , ("Result", A.Region (A.Position 0 0) (A.Position 0 0))
+  , ("Maybe", A.Region (A.Position 0 0) (A.Position 0 0))
+  , ("List", A.Region (A.Position 0 0) (A.Position 0 0))
+  , ("Debug", A.Region (A.Position 0 0) (A.Position 0 0))
+  , ("Basics", A.Region (A.Position 0 0) (A.Position 0 0))
+  ]
+
+
+importsToWarnings :: [Name] -> [Src.Import] -> [Reporting.Warning.Warning]
+importsToWarnings unusedNames imports =
+  importsToWarningsHelper unusedNames imports []
+
+
+importsToWarningsHelper :: [Name] -> [Src.Import] -> [Reporting.Warning.Warning] -> [Reporting.Warning.Warning]
+importsToWarningsHelper unusedNames imports warnings =
+  case imports of
+    [] -> warnings
+    (Src.Import (A.At region name) _ _) : remainingImports ->
+      if any (\unusedName -> unusedName == name) unusedNames
+        then importsToWarningsHelper unusedNames remainingImports (Reporting.Warning.UnusedImport region name : warnings)
+        else importsToWarningsHelper unusedNames remainingImports warnings
+
+
+canModuleName :: ModuleName.Canonical -> Name
+canModuleName (ModuleName.Canonical pkg modName) =
+  modName
+
+
+addUnused :: [Reporting.Warning.Warning] -> Maybe [Reporting.Warning.Warning] -> Maybe [Reporting.Warning.Warning]
+addUnused newWarnings maybeExisting =
+  case maybeExisting of
+    Nothing -> Just newWarnings
+    Just old -> Just (old <> newWarnings)
+
+
+usedModules :: Can.Module -> Set.Set ModuleName.Canonical
+usedModules (Can.Module name exports docs decls unions aliases binops effects) =
+  Set.unions
+    [ usedInDecls decls Set.empty
+    , Map.foldr (usedInUnion) Set.empty unions
+    , Map.foldr (usedInAlias) Set.empty aliases
+    ]
+
+
+usedInAlias :: Can.Alias -> Set.Set ModuleName.Canonical -> Set.Set ModuleName.Canonical
+usedInAlias (Can.Alias _ tipe) found =
+  usedInType tipe found
+
+
+usedInUnion :: Can.Union -> Set.Set ModuleName.Canonical -> Set.Set ModuleName.Canonical
+usedInUnion (Can.Union _ constructors _ _) found =
+  List.foldl
+    (\innerFound (Can.Ctor _ _ _ tipes) ->
+      List.foldl (\f tipe -> usedInType tipe f) innerFound tipes
+    )
+    found
+    constructors
+
+
+usedInType :: Can.Type -> Set.Set ModuleName.Canonical -> Set.Set ModuleName.Canonical
+usedInType type_ found =
+  case type_ of
+    Can.TLambda typeOne typeTwo ->
+      usedInType typeTwo $ usedInType typeOne $ found
+
+    Can.TVar _ ->
+      found
+
+    Can.TType modName name types ->
+      Set.insert modName $ List.foldl (flip usedInType) found types
+
+    Can.TRecord fields _ ->
+      List.foldr (\(Can.FieldType _ tipe) -> usedInType tipe)
+        found
+        fields
+
+    Can.TUnit ->
+      found
+
+    Can.TTuple one two Nothing ->
+      usedInType two $ usedInType one $ found
+
+    Can.TTuple one two (Just three) ->
+      usedInType three $ usedInType two $ usedInType one $ found
+
+    Can.TAlias modName _ fields (Can.Holey aliasType) ->
+      Set.insert modName $
+        usedInType aliasType $
+        List.foldr (\(_, tipe) -> usedInType tipe) found fields
+
+    Can.TAlias modName _ fields (Can.Filled aliasType) ->
+      Set.insert modName $
+        usedInType aliasType $
+        List.foldr (\(_, tipe) -> usedInType tipe) found fields
+
+
+usedInDecls :: Can.Decls -> Set.Set ModuleName.Canonical -> Set.Set ModuleName.Canonical
+usedInDecls decls found =
+  case decls of
+    Can.Declare def moarDecls ->
+      usedInDecls moarDecls $ (usedInDef def found)
+
+    Can.DeclareRec def defs moarDecls ->
+      usedInDecls moarDecls $ List.foldl (flip usedInDef) found (def : defs)
+
+    Can.SaveTheEnvironment ->
+      found
+
+
+usedInDef :: Can.Def -> Set.Set ModuleName.Canonical -> Set.Set ModuleName.Canonical
+usedInDef def found =
+  case def of
+    Can.Def _ patterns expr ->
+      usedInExpr expr $ List.foldl (flip usedInPattern) found patterns
+
+    Can.TypedDef _ _ patternTypes expr tipe ->
+      List.foldl
+        (\innerFound (pattern, patternTipe) ->
+          innerFound
+          & usedInPattern pattern
+          & usedInType patternTipe
+        )
+        found
+        patternTypes
+      & usedInExpr expr
+      & usedInType tipe
+
+
+usedInPattern :: Can.Pattern -> Set.Set ModuleName.Canonical -> Set.Set ModuleName.Canonical
+usedInPattern (A.At _ pattern) found =
+  case pattern of
+    Can.PCtor modName _ union _ _ args ->
+      List.foldl
+        (\innerFound (Can.PatternCtorArg _ tipe pattern) ->
+          innerFound
+          & usedInType tipe
+          & usedInPattern pattern
+        )
+        found
+        args
+      & usedInUnion union
+      & Set.insert modName
+
+    Can.PCons consOne consTwo ->
+      usedInPattern consOne found
+      & usedInPattern consTwo
+
+    Can.PList patterns ->
+      List.foldr usedInPattern found patterns
+
+    Can.PAlias pattern _ ->
+      usedInPattern pattern found
+
+    Can.PTuple one two Nothing ->
+      usedInPattern one found
+      & usedInPattern two
+
+    Can.PTuple one two (Just three) ->
+      usedInPattern one found
+      & usedInPattern two
+      & usedInPattern three
+
+    _ ->
+      found
+
+
+usedInExpr :: Can.Expr -> Set.Set ModuleName.Canonical -> Set.Set ModuleName.Canonical
+usedInExpr (A.At pos expr) found =
+  case expr of
+    Can.VarLocal _ ->
+      found
+
+    Can.VarTopLevel used _ ->
+      Set.insert used found
+
+    Can.VarKernel _ _ ->
+      found
+
+    Can.VarForeign used _ annotation ->
+      Set.insert used found
+      & usedInAnnotation annotation
+
+    Can.VarCtor _ used _ index annotation ->
+      Set.insert used found
+      & usedInAnnotation annotation
+
+    Can.VarDebug used _ annotation ->
+      Set.insert used found
+      & usedInAnnotation annotation
+
+    Can.VarOperator _ used _ annotation ->
+      Set.insert used found
+      & usedInAnnotation annotation
+
+    Can.Chr _ ->
+      found
+
+    Can.Str _ ->
+      found
+
+    Can.Int _ ->
+      found
+
+    Can.Float _ ->
+      found
+
+    Can.List exprList ->
+      List.foldr usedInExpr found exprList
+
+    Can.Negate expr ->
+      usedInExpr expr found
+
+    Can.Binop name used _ annotation exprOne exprTwo ->
+      Set.insert used found
+      & usedInExpr exprOne
+      & usedInExpr exprTwo
+      & usedInAnnotation annotation
+
+    Can.Lambda patternList expr ->
+      List.foldr usedInPattern found patternList
+      & usedInExpr expr
+
+    Can.Call expr exprList ->
+      List.foldr usedInExpr found exprList
+      & usedInExpr expr
+
+    Can.If listTuple expr ->
+      List.foldr
+        (\(oneExpr, twoExpr) f ->
+          usedInExpr oneExpr f
+          & usedInExpr twoExpr
+        )
+        found
+        listTuple
+      & usedInExpr expr
+
+    Can.Let def expr ->
+      found
+      & usedInDef def
+      & usedInExpr expr
+
+    Can.LetRec defList expr ->
+      List.foldr usedInDef found defList
+      & usedInExpr expr
+
+    Can.LetDestruct pattern oneExpr twoExpr ->
+      found
+      & usedInPattern pattern
+      & usedInExpr oneExpr
+      & usedInExpr twoExpr
+
+    Can.Case expr branches ->
+      branches
+      & List.foldr usedInBranch (usedInExpr expr found)
+
+    Can.Accessor _ ->
+      found
+
+    Can.Access expr _ ->
+      usedInExpr expr found
+
+    Can.Update _ expr record ->
+      Map.elems record
+      & List.foldl (\innerFound (Can.FieldUpdate _ expr) -> usedInExpr expr innerFound) found
+      & usedInExpr expr
+
+    Can.Record record ->
+      Map.elems record
+      & List.foldl (flip usedInExpr) found
+
+    Can.Unit ->
+      found
+
+    Can.Tuple one two Nothing ->
+      usedInExpr one found
+      & usedInExpr two
+
+    Can.Tuple one two (Just three) ->
+      usedInExpr one found
+      & usedInExpr two
+      & usedInExpr three
+
+    Can.Shader _ _ ->
+      found
+
+
+usedInBranch :: Can.CaseBranch -> Set.Set ModuleName.Canonical -> Set.Set ModuleName.Canonical
+usedInBranch (Can.CaseBranch pattern expr) found =
+  usedInExpr expr found
+  & usedInPattern pattern
+
+
+usedInAnnotation :: Can.Annotation -> Set.Set ModuleName.Canonical -> Set.Set ModuleName.Canonical
+usedInAnnotation (Can.Forall freevars type_) found =
+  usedInType type_ found

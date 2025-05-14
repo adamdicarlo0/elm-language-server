@@ -13,6 +13,8 @@ module Elm.Docs
   , Error(..)
   , decoder
   , encode
+  , Comment
+  , gatherTypes
   )
   where
 
