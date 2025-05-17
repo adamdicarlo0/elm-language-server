@@ -754,10 +754,10 @@ findDefinition_ ::
 findDefinition_ state details root path src position =
     let entity =
           maybe (Left DefinitionExitNoDefinedEntity) (\a -> Right a) $
-            findDefinedEntityInValues position (Src._values src)
+            findDefinedEntityInExports position (Src._exports src)
+              <|> findDefinedEntityInValues position (Src._values src)
 
         row = ((\(A.Position row _) -> row) position)
-
     in
     case entity of
       Right entity_@(DEVar defs patterns Src.LowVar name) ->
@@ -1086,6 +1086,34 @@ definedEntityToStr entity =
     DEVarQual _ _ _ prefix name -> Name.toChars prefix ++ "." ++ Name.toChars name ++ " (VarQual)"
     DEAccess _ _ record field -> "." ++ Name.toChars field ++ " (Access)"
     DEInfix name -> Name.toChars name ++ " (Infix)"
+
+
+findDefinedEntityInExports :: A.Position -> A.Located Src.Exposing -> Maybe DefinedEntity
+findDefinedEntityInExports pos exposing =
+  if isInRegion pos (A.toRegion exposing) then
+    case A.toValue exposing of
+      Src.Open -> Nothing
+      Src.Explicit exposed ->
+        foldr
+          (\a acc ->
+            case a of
+              Src.Lower name ->
+                if isInRegion pos (A.toRegion name)
+                  then Just $ DEVar [] [] Src.LowVar (A.toValue name)
+                  else acc
+              Src.Upper name _ ->
+                if isInRegion pos (A.toRegion name)
+                  then Just $ DEVar [] [] Src.CapVar (A.toValue name)
+                  else acc
+              Src.Operator region name ->
+                if isInRegion pos region
+                  then Just $ DEInfix name
+                  else acc
+          )
+          Nothing
+          exposed
+  else
+    Nothing
 
 
 findDefinedEntityInValues :: A.Position -> [A.Located Src.Value]-> Maybe DefinedEntity
