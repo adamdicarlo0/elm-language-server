@@ -1082,10 +1082,14 @@ data DefinedEntity
 definedEntityToStr :: DefinedEntity -> String
 definedEntityToStr entity =
   case entity of
-    DEVar _ _ _ name -> Name.toChars name ++ " (Var)"
-    DEVarQual _ _ _ prefix name -> Name.toChars prefix ++ "." ++ Name.toChars name ++ " (VarQual)"
-    DEAccess _ _ record field -> "." ++ Name.toChars field ++ " (Access)"
-    DEInfix name -> Name.toChars name ++ " (Infix)"
+    DEVar _ _ _ name ->
+      Name.toChars name ++ " (Var)"
+    DEVarQual _ _ _ prefix name ->
+      Name.toChars prefix ++ "." ++ Name.toChars name ++ " (VarQual)"
+    DEAccess _ _ record field ->
+      "." ++ Name.toChars field ++ " (Access)"
+    DEInfix name ->
+      Name.toChars name ++ " (Infix)"
 
 
 findDefinedEntityInExports :: A.Position -> A.Located Src.Exposing -> Maybe DefinedEntity
@@ -1116,20 +1120,59 @@ findDefinedEntityInExports pos exposing =
     Nothing
 
 
-findDefinedEntityInValues :: A.Position -> [A.Located Src.Value]-> Maybe DefinedEntity
-findDefinedEntityInValues position values =
+findDefinedEntityInValues :: A.Position -> [A.Located Src.Value] -> Maybe DefinedEntity
+findDefinedEntityInValues pos values =
   foldr
     (\located found ->
       case located of
-        A.At region (Src.Value name patterns body _) ->
-          if isPositionOnValueName position located
-            then Just (DEVar [] [] Src.LowVar (A.toValue name))
-          else if isInRegion position region
-            then findDefinedEntityInExpr position [] patterns (A.toValue body)
-            else found
+        A.At region (Src.Value name patterns body type_) ->
+          let a =
+                if isPositionOnValueName pos located
+                  then Just (DEVar [] [] Src.LowVar (A.toValue name))
+                else if isInRegion pos region
+                  then findDefinedEntityInExpr pos [] patterns (A.toValue body)
+                  else Nothing
+
+              b = findDefinedEntityInType pos Control.Monad.=<< type_
+          in
+          a <|> b <|> found
     )
     Nothing
     values
+
+
+findDefinedEntityInType :: A.Position -> Src.Type -> Maybe DefinedEntity
+findDefinedEntityInType pos type_ =
+  if isInRegion pos (A.toRegion type_)
+    then
+      case A.toValue type_ of
+        Src.TLambda arg ret ->
+          findDefinedEntityInType pos arg <|> findDefinedEntityInType pos ret
+
+        Src.TVar name ->
+          Nothing
+
+        Src.TType region name tlist ->
+          if isInRegion pos region
+            then Just (DEVar [] [] Src.CapVar name)
+            else foldr (\a acc -> findDefinedEntityInType pos a <|> acc) Nothing tlist
+
+        Src.TTypeQual region qual name tlist ->
+          if isInRegion pos region
+            then Just (DEVarQual [] [] Src.CapVar qual name)
+            else foldr (\a acc -> findDefinedEntityInType pos a <|> acc) Nothing tlist
+
+        Src.TRecord fields extRecord ->
+            foldr (\a acc -> findDefinedEntityInType pos (snd a) <|> acc) Nothing fields
+
+        Src.TUnit ->
+          Nothing
+
+        Src.TTuple a b rest ->
+            foldr (\a acc -> findDefinedEntityInType pos a <|> acc) Nothing (a : b : rest)
+
+    else
+      Nothing
 
 
 isPositionOnValueName :: A.Position -> A.Located Src.Value -> Bool
@@ -1254,12 +1297,16 @@ findDefinedEntityInExpr position defs patterns expr =
         foldr
           (\def acc ->
               case (A.toValue def) of
-                Src.Define _ patterns1 expr _ ->
-                  if isInRegion position (A.toRegion expr) then
-                    findDefinedEntityInExpr position (def : defs) (patterns1 ++ patterns) (A.toValue expr)
+                Src.Define _ patterns1 expr type_ ->
+                  let a = if isInRegion position (A.toRegion expr) then
+                            findDefinedEntityInExpr position (def : defs) (patterns1 ++ patterns) (A.toValue expr)
 
-                  else
-                    acc
+                          else
+                            acc
+
+                      b = findDefinedEntityInType position Control.Monad.=<< type_
+                  in
+                  a <|> b <|> acc
 
                 Src.Destruct pattern expr ->
                   if isInRegion position (A.toRegion expr) then
