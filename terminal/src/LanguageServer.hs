@@ -760,6 +760,7 @@ findDefinition_ state details root path src position =
           maybe (Left DefinitionExitNoDefinedEntity) (\a -> Right a) $
             findDefinedEntityInExports position (Src._exports src)
               <|> findDefinedEntityInValues position (Src._values src)
+              <|> findDefinedEntityInAliases position (Src._aliases src)
 
         row = ((\(A.Position row _) -> row) position)
     in
@@ -1257,6 +1258,23 @@ findDefinedEntityInExports pos exposing =
           exposed
   else
     Nothing
+
+
+findDefinedEntityInAliases :: A.Position -> [A.Located Src.Alias] -> Maybe DefinedEntity
+findDefinedEntityInAliases pos aliases =
+  foldr
+    (\(A.At region (Src.Alias name vars type_)) found ->
+      let a =
+            if isInRegion pos (A.toRegion name)
+              then Just (DEVar [] [] Src.CapVar (A.toValue name))
+              else Nothing
+
+          b = findDefinedEntityInType pos type_
+      in
+      a <|> b <|> found
+    )
+    Nothing
+    aliases
 
 
 findDefinedEntityInValues :: A.Position -> [A.Located Src.Value] -> Maybe DefinedEntity
