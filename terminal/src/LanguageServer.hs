@@ -714,6 +714,7 @@ data Found_
   | FoundAlias Src.Alias
   | FoundUnion Src.Union
   | FoundVariant (A.Located Name, [Src.Type])
+  | FoundModuleName Name
 
 
 findDefinition ::
@@ -762,6 +763,7 @@ findDefinition_ state details root path src position =
               <|> findDefinedEntityInValues position (Src._values src)
               <|> findDefinedEntityInAliases position (Src._aliases src)
               <|> findDefinedEntityInUnions position (Src._unions src)
+              <|> findDefinedEntityInImports position (Src._imports src)
 
         row = ((\(A.Position row _) -> row) position)
     in
@@ -832,11 +834,35 @@ findDefinition_ state details root path src position =
           )
           (findDefinitionForInfixInImports state details root (Src._imports src) name_)
 
+      Right entity_@(DEModuleName name_) ->
+        fmap
+          (\a -> a
+            >>= fmap (\(a, b, c) -> (a, b, fmap FoundModuleName c)) . maybe (Left (DefinitionExitNotFound entity_)) Right
+          )
+          (findDefinitionForModuleName state details root name_)
+
       Right entity ->
         return $ Left $ DefinitionExitNotFound entity
 
       Left exit ->
         return $ Left exit
+
+
+findDefinitionForModuleName ::
+  State
+  -> Details.Details
+  -> FilePath
+  -> ModuleName.Raw
+  -> IO (Either DefinitionExit (Maybe (FilePath, Src.Module, A.Located Name)))
+findDefinitionForModuleName state details root moduleName =
+  do  pathAndSrc <- loadSrcModule state details root moduleName
+
+      case pathAndSrc of
+        Right (path, src) ->
+          return $ Right $ fmap (\a -> (path, src, a)) (Src._name src)
+
+        Left exit ->
+          return $ Left exit
 
 
 findDefinitionForCapVarLocally :: Src.Module -> Name -> Maybe Found
@@ -941,7 +967,7 @@ findDefinitionForCapVarQualInImports state details root imports qual name =
     potentialSources =
       filter
         (\import_@(Src.Import iName iAlias iExposing) ->
-          A.toValue iName == qual || Just qual == iAlias
+          A.toValue iName == qual || Just qual == fmap A.toValue iAlias
         )
         imports
   in
@@ -1007,7 +1033,7 @@ findDefinitionForLowVarQualInImports state details root imports qual name =
     potentialSources =
       filter
         (\import_@(Src.Import iName iAlias iExposing) ->
-          A.toValue iName == qual || Just qual == iAlias
+          A.toValue iName == qual || Just qual == fmap A.toValue iAlias
         )
         imports
   in
@@ -1218,6 +1244,7 @@ data DefinedEntity
   | DEVarQual [A.Located Src.Def] [Src.Pattern] Src.VarType Name Name
   | DEAccess [A.Located Src.Def] [Src.Pattern] Src.Expr Name
   | DEInfix Name
+  | DEModuleName Name
 
 
 definedEntityToStr :: DefinedEntity -> String
@@ -1231,6 +1258,8 @@ definedEntityToStr entity =
       "." ++ Name.toChars field ++ " (Access)"
     DEInfix name ->
       Name.toChars name ++ " (Infix)"
+    DEModuleName name ->
+      Name.toChars name ++ " (Module)"
 
 
 findDefinedEntityInExports :: A.Position -> A.Located Src.Exposing -> Maybe DefinedEntity
@@ -1308,6 +1337,56 @@ findDefinedEntityInUnions pos unions =
     )
     Nothing
     unions
+
+
+findDefinedEntityInImports :: A.Position -> [Src.Import] -> Maybe DefinedEntity
+findDefinedEntityInImports pos imports =
+  foldr
+    (\(Src.Import name alias exposing) found ->
+      let a =
+            if isInRegion pos (A.toRegion name)
+              then Just (DEModuleName (A.toValue name))
+              else
+                maybe
+                  Nothing
+                    (\a ->
+                      if isInRegion pos (A.toRegion a)
+                        then Just (DEModuleName (A.toValue name))
+                        else Nothing
+                    )
+                    alias
+
+          b =
+            case exposing of
+              Src.Open ->
+                Nothing
+
+              Src.Explicit exposed ->
+                foldr
+                  (\a acc ->
+                    case a of
+                      Src.Lower name ->
+                        if isInRegion pos (A.toRegion name)
+                          then Just (DEVar [] [] Src.CapVar (A.toValue name))
+                          else acc
+
+                      Src.Upper name _ ->
+                        if isInRegion pos (A.toRegion name)
+                          then Just (DEVar [] [] Src.CapVar (A.toValue name))
+                          else acc
+
+                      Src.Operator region name ->
+                        if isInRegion pos region
+                          then Just (DEInfix name)
+                          else acc
+                  )
+                  Nothing
+                  exposed
+      in
+      a <|> b <|> found
+    )
+    Nothing
+    imports
 
 
 findDefinedEntityInValues :: A.Position -> [A.Located Src.Value] -> Maybe DefinedEntity
@@ -1617,9 +1696,17 @@ findReferences state filePath position =
                               let newRefs =
                                     case List.find (\a -> A.toValue (Src._import a) == Src.getName defSrc) (Src._imports importerSrc) of
                                       Just import_@(Src.Import _ alias _) ->
-                                        if isLowVarExposed import_ (A.toValue name)
-                                          then varInModule (A.toValue name) importerSrc ++ varQualInModule (Maybe.fromMaybe (Src.getImportName import_) alias) (A.toValue name) importerSrc
-                                          else varQualInModule (Maybe.fromMaybe (Src.getImportName import_) alias) (A.toValue name) importerSrc
+                                        if isLowVarExposed import_ (A.toValue name) then
+                                            varInModule (A.toValue name) importerSrc ++
+                                              varQualInModule
+                                                (Maybe.fromMaybe (Src.getImportName import_) (fmap A.toValue alias))
+                                                (A.toValue name)
+                                                importerSrc
+
+                                          else
+                                            varQualInModule
+                                              (Maybe.fromMaybe (Src.getImportName import_) (fmap A.toValue alias))
+                                              (A.toValue name) importerSrc
 
                                       Nothing -> []
 
